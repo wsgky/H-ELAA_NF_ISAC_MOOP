@@ -45,17 +45,15 @@ class SystemConfig:
 
     # ---- power & noise ----
     Pt_dBm: float = 30.0            # total TX power (dBm)
-    sigma2_dBm: float = -90.0       # noise power per CU (dBm)
-    sigma_s2_dBm: float = -90.0     # sensing noise (dBm)
+    sigma2_dBm: float = 0.0       # noise power per CU (dBm)
+    sigma_s2_dBm: float = 0.0     # sensing noise (dBm)
     L: int = 256                    # symbol block length
 
     # ---- path-gain / RCS ----
-    path_loss_exp: float = 2.0
-    los_gain_dB: float = -60.0      # reference LoS gain at r=1m
-    nlos_gain_dB: float = -75.0     # reference NLoS gain
-    rcs_st_dB: float = 10.0         # ST reflectivity (dBsm scale, relative)
-    rcs_cu_dB: float = -5.0         # CU reflectivity as clutter
-    rcs_eo_dB: float = 0.0          # EO reflectivity
+    kappa: float = 10.0             # Rician factor (LoS/NLoS power ratio)
+    rcs_st_dB: float = 0.0         # ST gamma^2 variance in dB (10^(x/10))
+    rcs_cu_dB: float = 0.0         # CU clutter gamma^2 variance in dB
+    rcs_eo_dB: float = 0.0          # EO gamma^2 variance in dB
 
     # ---- random seed ----
     seed: int = 2025

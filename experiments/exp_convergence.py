@@ -11,14 +11,14 @@ from algorithms import solve_SOOP1, solve_SOOP2, solve_MOOP
 
 def main():
     sys_cfg_base = SystemConfig(
-        Mt_h=16, Mt_v=16, Mr_h=16, Mr_v=16, N=8,
+        Mt_h=128, Mt_v=8, Mr_h=128, Mr_v=8, N=8,
         Kc=3, Ks=2, Ke=2, L=128, seed=2025,
     )
-    alg_cfg = AlgorithmConfig(outer_iters=15, inner_iters=20)
+    alg_cfg = AlgorithmConfig(outer_iters=15, inner_iters=50)
 
     structures = ["subarray", "fully_connected"]
     out = {"structures": {}, "alg_cfg": vars(alg_cfg)}
-
+    
     for struct in structures:
         cfg = copy.deepcopy(sys_cfg_base)
         cfg.rhs_structure = struct

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py smoke)",
+      "Bash(python main.py convergence)",
+      "Bash(python plot_results.py results/exp_convergence_20260506_160237.json)",
+      "Bash(Get-ChildItem -Path \"e:\\\\Research\\\\ISAC\\\\Simulation_main\\\\H-ELAA_NF_ISAC_MOOP_v2\\\\experiments\" -Force)"
+    ]
+  }
+}

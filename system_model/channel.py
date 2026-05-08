@@ -65,13 +65,16 @@ def generate_channel_vector(rng: np.random.Generator,
                             M_h: int, M_v: int, delta: float, lambda0: float,
                             r_range: Tuple[float, float],
                             J: int,
-                            los_gain_dB: float,
-                            nlos_gain_dB: float,
-                            path_loss_exp: float = 2.0,
+                            kappa: float,
                             position: np.ndarray = None,
                             ) -> Tuple[np.ndarray, dict]:
     """
-    Generate one CU channel h_k of length Mt and return associated geometry.
+    Generate one CU channel h_k of length Mt (Rician, no path loss).
+
+    h_k = sqrt(Mt)*alpha_0*b_0 + sqrt(Mt/J)*sum_{j=1}^{J} alpha_j*b_j
+
+    alpha_0 = sqrt(kappa/(kappa+1))   deterministic LoS gain
+    alpha_j ~ CN(0, 1/(kappa+1))      i.i.d. NLoS gains
     """
     Mt = M_h * M_v
     if position is None:
@@ -82,29 +85,25 @@ def generate_channel_vector(rng: np.random.Generator,
         phi0 = np.arctan2(pos[1], pos[0])
         theta0 = np.arcsin(pos[2] / max(r0, 1e-12))
 
-    los_gain_lin = 10 ** (los_gain_dB / 20)
-    alpha0 = los_gain_lin * (r0 ** (-path_loss_exp / 2)) \
-        * (rng.standard_normal() + 1j * rng.standard_normal()) / np.sqrt(2)
-
+    alpha0 = np.sqrt(kappa / (kappa + 1))  # real, deterministic
     b0 = near_field_array_response(M_h, M_v, delta, r0, phi0, theta0, lambda0)
-    h = alpha0 * b0
+    h = np.sqrt(Mt) * alpha0 * b0
 
-    # NLoS components, scatters around the user
-    nlos_gain_lin = 10 ** (nlos_gain_dB / 20)
+    nlos_var = 1.0 / (kappa + 1)
     info = {"r0": r0, "phi0": phi0, "theta0": theta0, "pos": pos,
             "alpha0": alpha0, "nlos_dirs": []}
     for j in range(J):
-        # nearby scatter (random offset)
         offset = rng.normal(scale=1.0, size=3)
         scatter_pos = pos + offset
         rj = np.linalg.norm(scatter_pos)
         rj = max(rj, 0.5)
         phij = np.arctan2(scatter_pos[1], scatter_pos[0])
         thetaj = np.arcsin(scatter_pos[2] / rj)
-        alphaj = nlos_gain_lin * (rj ** (-path_loss_exp / 2)) \
-            * (rng.standard_normal() + 1j * rng.standard_normal()) / np.sqrt(2)
+        alphaj = (np.sqrt(nlos_var)
+                  * (rng.standard_normal() + 1j * rng.standard_normal())
+                  / np.sqrt(2))
         bj = near_field_array_response(M_h, M_v, delta, rj, phij, thetaj, lambda0)
-        h = h + alphaj * bj / np.sqrt(J)
+        h = h + np.sqrt(Mt / J) * alphaj * bj
         info["nlos_dirs"].append((rj, phij, thetaj, alphaj))
 
     return h.reshape(1, Mt), info  # row vector (1, Mt) following manuscript
@@ -119,11 +118,12 @@ def generate_target_response(rng: np.random.Generator,
                              delta: float, lambda0: float,
                              positions: list,
                              rcs_dB: float,
-                             path_loss_exp: float = 2.0,
                              ) -> Tuple[np.ndarray, list, list, list]:
     """
     Build G = sum_i beta_i * b_r(r_i, phi_i, theta_i) * b_t^H(r_i, phi_i, theta_i)
     of size (Mr, Mt).
+
+    beta_i ~ CN(0, gamma2) where gamma2 = 10^(rcs_dB/10), no path loss.
 
     Returns
     -------
@@ -137,16 +137,15 @@ def generate_target_response(rng: np.random.Generator,
     G = np.zeros((Mr, Mt), dtype=complex)
     Bt_list, Br_list, gammas2 = [], [], []
 
-    rcs_lin = 10 ** (rcs_dB / 20)
+    gamma2 = 10 ** (rcs_dB / 10)  # variance, no path loss
 
     for pos in positions:
         r = np.linalg.norm(pos)
         phi = np.arctan2(pos[1], pos[0])
         theta = np.arcsin(pos[2] / max(r, 1e-12))
-        # complex reflectivity, CN(0, gamma_i^2)
-        gamma2 = (rcs_lin * (r ** (-path_loss_exp))) ** 2
-        beta = np.sqrt(gamma2) * (rng.standard_normal()
-                                  + 1j * rng.standard_normal()) / np.sqrt(2)
+        beta = (np.sqrt(gamma2)
+                * (rng.standard_normal() + 1j * rng.standard_normal())
+                / np.sqrt(2))
         bt = near_field_array_response(Mt_h, Mt_v, delta, r, phi, theta, lambda0)
         br = near_field_array_response(Mr_h, Mr_v, delta, r, phi, theta, lambda0)
         G += beta * np.outer(br, bt.conj())

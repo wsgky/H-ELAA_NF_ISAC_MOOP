@@ -32,36 +32,43 @@ def build_array_positions(M_h: int, M_v: int, delta: float) -> np.ndarray:
 def feed_positions(N: int, M_h: int, M_v: int, delta: float,
                    structure: str = "subarray") -> np.ndarray:
     """
-    Position of the N feeds u_i (3D).
-
-    For both structures the feeds are placed slightly behind the surface
-    (x = -delta) and roughly aligned with the centroids of their
-    associated element groups, so that the phase matrix Phi is well
-    behaved.
+    Position of the N feeds u_i (3D), all on the array plane (x = 0).
 
     Parameters
     ----------
     structure : {"fully_connected", "subarray"}
+        fully_connected : N feeds on a 2-D uniform grid spanning the full
+                          aperture; aspect ratio N_h_f × N_v_f is chosen
+                          to best match M_h / M_v.
+        subarray        : each feed at the centroid of its M/N-element block.
     """
     V = build_array_positions(M_h, M_v, delta)  # (M, 3)
     M = M_h * M_v
     if structure == "fully_connected":
-        # Place N feeds along a horizontal line, slightly behind the surface
-        # and roughly spanning the array's vertical centre.
-        ys = np.linspace(V[:, 1].min(), V[:, 1].max(), N)
-        z_mid = 0.5 * (V[:, 2].min() + V[:, 2].max())
-        U = np.stack([-delta * np.ones(N), ys, z_mid * np.ones(N)], axis=1)
-        return U
+        # Factor N into (N_h_f, N_v_f) with aspect ratio closest to M_h/M_v.
+        best = None
+        for n_h in range(1, N + 1):
+            if N % n_h == 0:
+                n_v = N // n_h
+                score = abs(n_h / n_v - M_h / M_v)
+                if best is None or score < best[0]:
+                    best = (score, n_h, n_v)
+        N_h_f, N_v_f = best[1], best[2]
+        ys = np.linspace(V[:, 1].min(), V[:, 1].max(), N_h_f)
+        zs = np.linspace(V[:, 2].min(), V[:, 2].max(), N_v_f)
+        # Ordering: n_v outer, n_h inner — consistent with build_array_positions.
+        NV, NH = np.meshgrid(np.arange(N_v_f), np.arange(N_h_f), indexing="ij")
+        y_feed = ys[NH.flatten()]
+        z_feed = zs[NV.flatten()]
+        return np.stack([np.zeros(N), y_feed, z_feed], axis=1)
     elif structure == "subarray":
         if M % N != 0:
             raise ValueError(f"For sub-array structure, N={N} must divide Mt={M}.")
         Msub = M // N
-        # The i-th feed is centred on the i-th block of M_sub elements.
         U = np.zeros((N, 3))
         for i in range(N):
             block = V[i * Msub:(i + 1) * Msub]
-            U[i] = block.mean(axis=0)
-            U[i, 0] = -delta  # slightly behind
+            U[i] = block.mean(axis=0)  # x = 0 naturally since all elements have x = 0
         return U
     else:
         raise ValueError(f"Unknown structure: {structure}")

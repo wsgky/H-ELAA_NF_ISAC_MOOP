@@ -42,13 +42,18 @@ from .soop2_sense import solve_SOOP2
 
 
 # =====================================================================
-# SP5 fallback (no CVX): gradient ascent on a weighted (R + I) objective
+# SP5 fallback (no CVX): projected gradient ascent on the scalarised
+# Tchebycheff objective tau = min(omega1*(R-R*)/R*, omega2*(I-I*)/I*).
 # =====================================================================
-def _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev, omega1, omega2):
+def _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev, omega1, omega2,
+                  R_star, I_star):
     """
-    When CVX is unavailable, take a short PGD on W to approximately
-    improve the weighted objective. This won't give exact tau but is
-    sufficient for end-to-end smoke testing.
+    Approximately solve SP5 by projected gradient ascent on a smooth
+    approximation of  min{ omega1*(R-R*)/R*,  omega2*(I-I*)/I* }.
+
+    Uses log-sum-exp soft-min:
+        tau_smooth = -beta^{-1} * log( exp(-beta*A1) + exp(-beta*A2) )
+    where A1, A2 are the two normalised slack values.
     """
     Phi = scenario.Phi
     H = scenario.H
@@ -60,37 +65,102 @@ def _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev, omega1, omega2):
     sigma_s2 = sys_cfg.sigma_s2
     L = sys_cfg.L
     F = compute_F(a, Phi)
+    R_star = max(R_star, 1e-9)
+    I_star = max(I_star, 1e-9)
 
     W = W_prev.copy()
+    W = scale_W_to_power(F, W, Pt)
 
-    for _ in range(8):
-        # finite-difference style gradient on R+I via analytic forms
+    # pre-compute b_t outer products needed for I gradient
+    # I = sum_i log(1 + c_i * b_i^H F W W^H F^H b_i),  c_i = L Mr gamma_i^2/sigma_s2
+    Bt = scenario.Bt_s                        # (Mt, Ks)
+    c_sens = (L * Mr * scenario.gamma_s2) / sigma_s2
+
+    beta_sm = 0.5   # smoother: both objectives contribute gradient
+    best_tau = -np.inf
+    best_W = W.copy()
+
+    for it in range(40):
         FW = F @ W
-        # gradient of sum_k log(1+SINR_k) w.r.t. W (use a simple zero-grad
-        # approximation: drive W toward MRT of effective channel)
-        # MRT step
-        H_eff = H @ F                          # (Kc, N)
-        # normalise rows
+        # ----- compute R, I and their gradients w.r.t. W -----
+        # Communication: standard MU-MISO sum-rate gradient
+        # SINR_k = |hk F wk|^2 / (sum_{j!=k}|hk F wj|^2 + ||hk F W^[s]||^2 + sigma2)
+        # We keep all (Kc+Ks) columns active.
+        HF = H @ F                            # (Kc, N)
+        sig = HF @ W                          # (Kc, Kc+Ks)
+        abs2 = np.abs(sig) ** 2
+
+        grad_R = np.zeros_like(W)
+        R_val = 0.0
         for k in range(Kc):
-            denom = np.linalg.norm(H_eff[k]) + 1e-12
-            W[:, k] = 0.7 * W[:, k] + 0.3 * (H_eff[k].conj() / denom) \
-                * np.sqrt(Pt / (Kc + Ks))
+            inter = abs2[k, :].sum() - abs2[k, k] + sigma2
+            sinr_k = abs2[k, k] / max(inter, 1e-30)
+            R_val += np.log(1.0 + sinr_k)     # nats
+            # dR_k/dW: standard MMSE-style gradient
+            # numerator gradient
+            ek = np.zeros(Kc + Ks); ek[k] = 1.0
+            denom_total = abs2[k, :].sum() + sigma2
+            # signal grad: 2 (HF[k])^H * sig[k,:] / denom_total  (but only col k)
+            # interference grad: -sinr * 2 (HF[k])^H * sig[k,:] / denom_total (other cols)
+            hk_F = HF[k:k+1]                   # (1, N)
+            # grad of log(num/den + 1) = grad log(num+den) - grad log(den)
+            num = abs2[k, k]
+            den = inter
+            num_plus_den = num + den
+            # grad log(num+den) wrt W: 2 hk_F^H sig[k,:] / num_plus_den
+            # grad log(den) wrt W:  same but with col k zeroed
+            sig_k = sig[k:k+1, :]              # (1, Kc+Ks)
+            sig_k_int = sig_k.copy()
+            sig_k_int[0, k] = 0.0
+            grad_R += (2.0 / max(num_plus_den, 1e-30)) * (hk_F.conj().T @ sig_k) \
+                    - (2.0 / max(den, 1e-30)) * (hk_F.conj().T @ sig_k_int)
 
-        # sensing streams: align with strongest ST
-        for s in range(Ks):
-            g = F.conj().T @ scenario.Bt_s[:, s]
-            denom = np.linalg.norm(g) + 1e-12
-            W[:, Kc + s] = 0.7 * W[:, Kc + s] + 0.3 * (g / denom) \
-                * np.sqrt(omega2 * Pt / (Kc + Ks))
+        # Sensing
+        I_val = 0.0
+        grad_I = np.zeros_like(W)
+        FtF_per_b = []                         # for re-use
+        for i in range(Ks):
+            b = Bt[:, i]
+            Fb = F.conj().T @ b                # (N,)
+            FtF_per_b.append(Fb)
+            gain = float(np.real(np.conj(Fb) @ (W @ W.conj().T) @ Fb))
+            arg = c_sens[i] * gain
+            I_val += np.log(1.0 + arg)
+            # d/dW [Fb^H W W^H Fb] = 2 Fb Fb^H W
+            grad_I += (2.0 * c_sens[i] / (1.0 + arg)) * np.outer(Fb, Fb.conj()) @ W
 
-        # power scaling
+        # convert to bits/Hz so it matches R_star, I_star (both bits/Hz)
+        ln2 = np.log(2.0)
+        R_bits = R_val / ln2
+        I_bits = I_val / ln2
+        grad_R = grad_R / ln2
+        grad_I = grad_I / ln2
+
+        A1 = omega1 * (R_bits - R_star) / R_star
+        A2 = omega2 * (I_bits - I_star) / I_star
+        # soft-min weights (sum to 1, softmax of -beta*A)
+        m = max(-A1, -A2)
+        e1 = np.exp(-beta_sm * A1 + beta_sm * (-m))
+        e2 = np.exp(-beta_sm * A2 + beta_sm * (-m))
+        Z = e1 + e2 + 1e-30
+        w1 = e1 / Z; w2 = e2 / Z
+        tau_smooth = min(A1, A2)
+
+        if tau_smooth > best_tau:
+            best_tau = tau_smooth
+            best_W = W.copy()
+
+        # gradient of soft-min wrt W
+        gW = w1 * (omega1 / R_star) * grad_R + w2 * (omega2 / I_star) * grad_I
+
+        # normalized fixed step
+        s = 0.01 / (np.linalg.norm(gW) + 1e-9)
+        W = W + s * gW
+
+        # project onto power constraint
         W = scale_W_to_power(F, W, Pt)
 
-    # estimate tau roughly
-    R_now = sum_rate(scenario.H, F, W, sigma2, Kc)
-    I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
-                       sigma_s2, L, Mr)
-    return W, None
+    return best_W, best_tau
 
 
 # =====================================================================
@@ -115,11 +185,10 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
     HF = H @ F                                     # (Kc, N)
 
     if not _HAVE_CVX:
-        # ---- fallback: do a few projected-gradient steps on W ----
-        # Maximise w.r.t. W:  J = R(W) + I(W)  weighted by current
-        # coefficients (omega1/omega2) -- a heuristic but feasible warm-start.
+        # ---- fallback: projected gradient ascent on the smoothed
+        # Tchebycheff objective ----
         return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
-                             omega1, omega2)
+                             omega1, omega2, R_star, I_star)
 
     # ---- compute aux variables mu*, xi* with the previous W ----
     sig = HF @ W_prev                              # (Kc, Kc+Ks)
@@ -208,7 +277,9 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
         prob.solve(solver="SCS", verbose=False)
 
     if W_var.value is None:
-        return W_prev, None
+        # CVX failed: fall back to gradient ascent on the smoothed objective
+        return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
+                             omega1, omega2, R_star, I_star)
     W_new = np.asarray(W_var.value)
     # safety
     W_new = scale_W_to_power(F, W_new, Pt)
@@ -381,25 +452,65 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
 
     history = {"sum_rate": [], "sensing_mi": [], "tau": []}
     lam1_init = None
-    for it in range(alg_cfg.outer_iters):
-        # SP5
-        W, tau_val = _solve_SP5(scenario, sys_cfg, alg_cfg,
-                                a, W, R_star, I_star, omega1, omega2)
-        F = compute_F(a, Phi)
-        W = scale_W_to_power(F, W, Pt)
-        # SP6
-        a, lam1_init, _ = _solve_SP6(scenario, sys_cfg, alg_cfg,
-                                     a, W, R_star, I_star, omega1, omega2,
-                                     lam1_init=lam1_init)
-        F = compute_F(a, Phi)
-        W = scale_W_to_power(F, W, Pt)
 
-        R_now = sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc)
-        I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
+    R_star_safe = max(R_star, 1e-9)
+    I_star_safe = max(I_star, 1e-9)
+
+    def _tau(R, I):
+        return min(omega1 * (R - R_star_safe) / R_star_safe,
+                   omega2 * (I - I_star_safe) / I_star_safe)
+
+    # initial tau
+    R0 = sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc)
+    I0 = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
+                    sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
+    best_tau = _tau(R0, I0)
+    best_a, best_W = a.copy(), W.copy()
+    best_R, best_I = R0, I0
+
+    for it in range(alg_cfg.outer_iters):
+        a_prev_iter, W_prev_iter = a.copy(), W.copy()
+        # SP5
+        W_new, tau_val = _solve_SP5(scenario, sys_cfg, alg_cfg,
+                                    a, W, R_star, I_star, omega1, omega2)
+        F = compute_F(a, Phi)
+        W_new = scale_W_to_power(F, W_new, Pt)
+        # SP6
+        a_new, lam1_init, _ = _solve_SP6(scenario, sys_cfg, alg_cfg,
+                                         a, W_new, R_star, I_star,
+                                         omega1, omega2, lam1_init=lam1_init)
+        F_new = compute_F(a_new, Phi)
+        W_new = scale_W_to_power(F_new, W_new, Pt)
+
+        R_new = sum_rate(scenario.H, F_new, W_new, sys_cfg.sigma2, Kc)
+        I_new = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_new, W_new,
                            sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
+        tau_new = _tau(R_new, I_new)
+
+        da = np.linalg.norm(a_new - a_prev_iter)
+        dW = np.linalg.norm(W_new - W_prev_iter, 'fro')
+
+        # first iteration always accepted to give tau a free exploration step
+        if it == 0 or tau_new >= best_tau - 1e-9:
+            a, W = a_new, W_new
+            best_tau = tau_new
+            best_a, best_W = a.copy(), W.copy()
+            best_R, best_I = R_new, I_new
+            R_now, I_now = R_new, I_new
+        else:
+            # reject: keep previous iterate
+            a, W = a_prev_iter, W_prev_iter
+            F_now = compute_F(a, Phi)
+            R_now = sum_rate(scenario.H, F_now, W, sys_cfg.sigma2, Kc)
+            I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_now, W,
+                               sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
+
+        print(f"  [MOOP it={it}] R={R_now:.3f} I={I_now:.3f} tau={tau_new:.4f}"
+              f"  ||da||={da:.4f} ||dW||_F={dW:.4f}")
+
         history["sum_rate"].append(R_now)
         history["sensing_mi"].append(I_now)
-        history["tau"].append(tau_val)
+        history["tau"].append(tau_new)
 
         if it > 1:
             d1 = abs(history["sum_rate"][-1] - history["sum_rate"][-2])
@@ -407,9 +518,19 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             if d1 < alg_cfg.tol and d2 < alg_cfg.tol:
                 break
 
+    # always return the best iterate seen
+    a, W = best_a, best_W
+    F = compute_F(a, Phi)
+
+    R_final = sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc)
+    I_final = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
+                         sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
     return {
-        "W": W, "A": np.diag(a), "a": a, "F": compute_F(a, Phi),
+        "W": W, "A": np.diag(a), "a": a, "F": F,
         "history": history,
         "R_star": R_star, "I_star": I_star,
         "omega1": omega1, "omega2": omega2,
+        "tau_final": _tau(R_final, I_final),
+        "relative_R": R_final / R_star_safe,
+        "relative_I": I_final / I_star_safe,
     }

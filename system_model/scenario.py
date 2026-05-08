@@ -110,8 +110,7 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
     for k in range(Kc):
         h_k, info = generate_channel_vector(
             rng, cfg.Mt_h, cfg.Mt_v, cfg.delta, cfg.lambda0,
-            cfg.near_field_radius, cfg.J_nlos,
-            cfg.los_gain_dB, cfg.nlos_gain_dB, cfg.path_loss_exp)
+            cfg.near_field_radius, cfg.J_nlos, cfg.kappa)
         H[k:k+1] = h_k
         cu_info.append(info)
         cu_positions.append(info["pos"])
@@ -122,8 +121,7 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
                                                rk, pk, tk, cfg.lambda0)
         Br_c[:, k] = near_field_array_response(cfg.Mr_h, cfg.Mr_v, cfg.delta,
                                                rk, pk, tk, cfg.lambda0)
-        rcs_lin = 10 ** (cfg.rcs_cu_dB / 20)
-        gamma_c2[k] = (rcs_lin * (rk ** (-cfg.path_loss_exp))) ** 2
+        gamma_c2[k] = 10 ** (cfg.rcs_cu_dB / 10)
 
     # ---------------- STs ----------------
     Ks = cfg.Ks
@@ -131,7 +129,6 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
     Bt_s = np.zeros((Mt, Ks), dtype=complex)
     Br_s = np.zeros((cfg.Mr, Ks), dtype=complex)
     gamma_s2 = np.zeros(Ks)
-    rcs_lin_s = 10 ** (cfg.rcs_st_dB / 20)
     for i in range(Ks):
         pos, r, phi, theta = random_near_field_position(rng, cfg.near_field_radius)
         st_positions.append(pos)
@@ -139,7 +136,7 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
                                                r, phi, theta, cfg.lambda0)
         Br_s[:, i] = near_field_array_response(cfg.Mr_h, cfg.Mr_v, cfg.delta,
                                                r, phi, theta, cfg.lambda0)
-        gamma_s2[i] = (rcs_lin_s * (r ** (-cfg.path_loss_exp))) ** 2
+        gamma_s2[i] = 10 ** (cfg.rcs_st_dB / 10)
 
     # ---------------- EOs ----------------
     Ke = cfg.Ke
@@ -147,7 +144,6 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
     Bt_e = np.zeros((Mt, Ke), dtype=complex)
     Br_e = np.zeros((cfg.Mr, Ke), dtype=complex)
     gamma_e2 = np.zeros(Ke)
-    rcs_lin_e = 10 ** (cfg.rcs_eo_dB / 20)
     for j in range(Ke):
         pos, r, phi, theta = random_near_field_position(rng, cfg.near_field_radius)
         eo_positions.append(pos)
@@ -155,7 +151,7 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
                                                r, phi, theta, cfg.lambda0)
         Br_e[:, j] = near_field_array_response(cfg.Mr_h, cfg.Mr_v, cfg.delta,
                                                r, phi, theta, cfg.lambda0)
-        gamma_e2[j] = (rcs_lin_e * (r ** (-cfg.path_loss_exp))) ** 2
+        gamma_e2[j] = 10 ** (cfg.rcs_eo_dB / 10)
 
     return Scenario(
         Mt_h=cfg.Mt_h, Mt_v=cfg.Mt_v, Mr_h=cfg.Mr_h, Mr_v=cfg.Mr_v,
