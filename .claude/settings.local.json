@@ -4,7 +4,15 @@
       "Bash(python main.py smoke)",
       "Bash(python main.py convergence)",
       "Bash(python plot_results.py results/exp_convergence_20260506_160237.json)",
-      "Bash(Get-ChildItem -Path \"e:\\\\Research\\\\ISAC\\\\Simulation_main\\\\H-ELAA_NF_ISAC_MOOP_v2\\\\experiments\" -Force)"
+      "Bash(Get-ChildItem -Path \"e:\\\\Research\\\\ISAC\\\\Simulation_main\\\\H-ELAA_NF_ISAC_MOOP_v2\\\\experiments\" -Force)",
+      "Bash(python plot_results.py results/exp_montecarlo_20260509_002621.json)",
+      "Bash(python main.py SOOP1_testing 3)",
+      "Bash(python -c \"from algorithms.soop1_comm import _sp2_inner; import inspect; src=inspect.getsource\\(_sp2_inner\\); print\\(src[src.find\\('lambda_max'\\):src.find\\('lambda_max'\\)+400]\\)\")",
+      "Bash(python -c \"from algorithms.soop1_comm import _sp2_inner; import inspect; src=inspect.getsource\\(_sp2_inner\\); print\\(src[src.find\\('lambda_max'\\):src.find\\('lambda_max'\\)+300]\\)\")",
+      "Bash(python main.py SOOP1_testing 2)",
+      "Bash(python -c ' *)",
+      "Bash(python main.py SOOP1_testing 5)",
+      "Bash(grep -v \"^\\\\s*$\")"
     ]
   }
 }

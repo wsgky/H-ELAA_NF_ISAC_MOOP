@@ -34,7 +34,7 @@ class SystemConfig:
     # ---- carrier / wavelength ----
     fc: float = 30e9                # carrier frequency (Hz), mmWave
     eps_r: float = 3.0              # relative permittivity inside waveguide
-    delta_factor: float = 0.5       # delta = delta_factor * lambda0
+    delta_factor: float = 0.25       # delta = delta_factor * lambda0
 
     # ---- users / targets ----
     Kc: int = 3                     # # CUs
@@ -44,7 +44,7 @@ class SystemConfig:
     near_field_radius: Tuple[float, float] = (2.0, 15.0)  # meters
 
     # ---- power & noise ----
-    Pt_dBm: float = 30.0            # total TX power (dBm)
+    Pt_dBm: float = 10.0            # total TX power (dBm)
     sigma2_dBm: float = 0.0       # noise power per CU (dBm)
     sigma_s2_dBm: float = 0.0     # sensing noise (dBm)
     L: int = 256                    # symbol block length
@@ -99,11 +99,12 @@ class SystemConfig:
 class AlgorithmConfig:
     # ---- outer / inner iterations ----
     outer_iters: int = 20
-    inner_iters: int = 30
+    inner_iters: int = 100   # FP surrogate refreshes per outer iter (SOOP1 SP2)
+    pgd_steps: int = 20      # PGD steps per surrogate refresh (SOOP1 SP2)
     tol: float = 1e-4
 
     # ---- step sizes ----
-    pgd_step_a: float = 5e-3        # for amplitude PGD (SOOP2 / MOOP)
+    pgd_step_a: float = 5e-4        # for amplitude PGD (SOOP2 / MOOP)
     pgd_step_lambda: float = 1e-2   # for dual update (MOOP)
 
     # ---- weighting (Tchebycheff) ----

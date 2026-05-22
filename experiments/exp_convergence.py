@@ -16,7 +16,7 @@ def main():
     )
     alg_cfg = AlgorithmConfig(outer_iters=15, inner_iters=50)
 
-    structures = ["subarray", "fully_connected"]
+    structures = ["fully_connected","subarray"]
     out = {"structures": {}, "alg_cfg": vars(alg_cfg)}
     
     for struct in structures:

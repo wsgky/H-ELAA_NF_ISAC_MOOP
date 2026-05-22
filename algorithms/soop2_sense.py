@@ -125,16 +125,21 @@ def _omega_to_W(Omega: np.ndarray, target_dim: int) -> np.ndarray:
 def _sp4_inner(a_init: np.ndarray, Phi: np.ndarray, W: np.ndarray,
                Bt_s: np.ndarray, gamma_s2: np.ndarray,
                sigma_s2: float, L: int, Mr: int,
-               iters: int = 30, step: float = 5e-3
-               ) -> np.ndarray:
+               iters: int = 30, step: float = 5e-3,
+               full_history: bool = False,
+               H: np.ndarray = None, sigma2: float = 0.0, Kc: int = 0,
+               ):
     """
     SP4 amplitude update via projected gradient ascent on the surrogate
-    g_tilde (Eq. 85). Step size is rescaled by 1 / (1 + ||Q_k|| sums).
+    g_tilde (Eq. 85). Step size is rescaled by 1 / (||Q_k|| sums).
+
+    When full_history=True, records sensing_mi (and sum_rate if H is given)
+    after every PGD step and returns (best_a, hist_I, hist_R).
+    Otherwise returns a (current behaviour).
     """
     Mt = a_init.size
     a = a_init.copy()
 
-    # Pre-compute  D_k = diag(b_t_k);  Q_k = D_k^H Phi W W^H Phi^H D_k
     Ks = Bt_s.shape[1]
     Q_list = []
     coeff = []
@@ -143,38 +148,60 @@ def _sp4_inner(a_init: np.ndarray, Phi: np.ndarray, W: np.ndarray,
 
     for k in range(Ks):
         bk = Bt_s[:, k]                            # (Mt,)
-        # D_k = diag(bk);  D_k^H Phi W W^H Phi^H D_k = diag(bk^*) M diag(bk)
         Q = np.conj(bk)[:, None] * PhiW_PhiW_H * bk[None, :]
         Q_list.append(Q)
         coeff.append((L * Mr * gamma_s2[k]) / sigma_s2)
 
-    # Adaptive step
     Q_norms = np.array([np.linalg.norm(Qk, 'fro') for Qk in Q_list])
     base = max(np.sum(Q_norms), 1.0)
     eff_step = step / base
 
-    for t in range(iters):
-        z = a.copy()       # surrogate anchor (Eq. 86: z^(t) = a^(t-1))
-        # gradient of  sum_k log(1 + c_k * (2 z^T Q_k a - z^T Q_k z)).
+    if full_history:
+        best_I = float(sensing_mi(Bt_s, gamma_s2, compute_F(a, Phi),
+                                  W, sigma_s2, L, Mr))
+        best_a = a.copy()
+        hist_I: list = []
+        hist_R: list = []
+
+    for _ in range(iters):
+        z    = a.copy()                            # surrogate anchor (Eq. 86)
         grad = np.zeros(Mt)
         for k in range(Ks):
-            Qk = Q_list[k]
-            ck = coeff[k]
-            # work with real parts since the bilinear form is real for our Q
-            Qz = Qk @ z
+            Qk  = Q_list[k]
+            ck  = coeff[k]
+            Qz  = Qk @ z
             zQz = float(np.real(z @ Qz))
             zQa = float(np.real(z @ (Qk @ a)))
-            denom = 1.0 + ck * (2.0 * zQa - zQz)
-            denom = max(denom, 1e-12)
+            denom = max(1.0 + ck * (2.0 * zQa - zQz), 1e-12)
             grad += ck * 2.0 * np.real(Qz) / denom
         a = project_box(a + eff_step * grad, 0.0, 1.0)
 
+        if full_history:
+            F_now = compute_F(a, Phi)
+            I_now = float(sensing_mi(Bt_s, gamma_s2, F_now, W, sigma_s2, L, Mr))
+            hist_I.append(I_now)
+            hist_R.append(float(sum_rate(H, F_now, W, sigma2, Kc))
+                          if H is not None else 0.0)
+            if I_now > best_I + 1e-9:
+                best_I = I_now
+                best_a = a.copy()
+
+    if full_history:
+        return best_a, hist_I, hist_R
     return a
 
 
-def solve_SOOP2(scenario, sys_cfg, alg_cfg):
+def solve_SOOP2(scenario, sys_cfg, alg_cfg, full_history: bool = False):
     """
     Run Algorithm 2 on a given scenario.
+
+    Parameters
+    ----------
+    full_history : bool
+        When True, disables early stopping and additionally stores
+        ``history["inner_sensing_mi"]`` and ``history["inner_sum_rate"]``:
+        each is a list of length outer_iters, where element i is
+        ``[metric_after_SDP, metric_inner_1, ..., metric_inner_T]``.
     """
     rng = np.random.default_rng(sys_cfg.seed + 13)
     Mt, N = scenario.Mt, scenario.N
@@ -185,7 +212,15 @@ def solve_SOOP2(scenario, sys_cfg, alg_cfg):
     a = rng.uniform(0.3, 1.0, size=Mt)
     Phi = scenario.Phi
     target_dim = Kc + Ks
+
     history = {"sum_rate": [], "sensing_mi": []}
+    if full_history:
+        history["inner_sensing_mi"] = []
+        history["inner_sum_rate"]   = []
+
+    best_I = -np.inf
+    best_a = a.copy()
+    best_W = None
 
     for it in range(alg_cfg.outer_iters):
         F = compute_F(a, Phi)
@@ -198,27 +233,51 @@ def solve_SOOP2(scenario, sys_cfg, alg_cfg):
         W = _omega_to_W(Omega, target_dim)
         W = scale_W_to_power(F, W, Pt)
 
-        # SP4: amplitude
-        a = _sp4_inner(a, Phi, W,
-                       scenario.Bt_s, scenario.gamma_s2,
-                       sigma_s2, sys_cfg.L, scenario.Mr,
-                       iters=alg_cfg.inner_iters,
-                       step=alg_cfg.pgd_step_a)
+        # Anchor metrics right after SDP (before SP4 amplitude update)
+        I_after_sdp = float(sensing_mi(scenario.Bt_s, scenario.gamma_s2,
+                                       F, W, sigma_s2, sys_cfg.L, scenario.Mr))
+        R_after_sdp = float(sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc))
+
+        # SP4: amplitude update
+        if full_history:
+            a, hist_I, hist_R = _sp4_inner(
+                a, Phi, W, scenario.Bt_s, scenario.gamma_s2,
+                sigma_s2, sys_cfg.L, scenario.Mr,
+                iters=alg_cfg.inner_iters, step=alg_cfg.pgd_step_a,
+                full_history=True,
+                H=scenario.H, sigma2=sys_cfg.sigma2, Kc=Kc)
+            history["inner_sensing_mi"].append([I_after_sdp] + hist_I)
+            history["inner_sum_rate"].append([R_after_sdp] + hist_R)
+        else:
+            a = _sp4_inner(a, Phi, W,
+                           scenario.Bt_s, scenario.gamma_s2,
+                           sigma_s2, sys_cfg.L, scenario.Mr,
+                           iters=alg_cfg.inner_iters,
+                           step=alg_cfg.pgd_step_a)
 
         F = compute_F(a, Phi)
         W = scale_W_to_power(F, W, Pt)
 
-        history["sum_rate"].append(sum_rate(scenario.H, F, W,
-                                            sys_cfg.sigma2, Kc))
-        history["sensing_mi"].append(sensing_mi(scenario.Bt_s,
-                                                scenario.gamma_s2,
-                                                F, W, sigma_s2,
-                                                sys_cfg.L, scenario.Mr))
-        if it > 1 and abs(history["sensing_mi"][-1]
-                          - history["sensing_mi"][-2]) < alg_cfg.tol:
-            break
+        I_now = float(sensing_mi(scenario.Bt_s, scenario.gamma_s2,
+                                 F, W, sigma_s2, sys_cfg.L, scenario.Mr))
+        R_now = float(sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc))
+        history["sensing_mi"].append(I_now)
+        history["sum_rate"].append(R_now)
 
+        if I_now > best_I:
+            best_I = I_now
+            best_a  = a.copy()
+            best_W  = W.copy()
+
+        if not full_history:
+            if it > 1 and abs(history["sensing_mi"][-1]
+                              - history["sensing_mi"][-2]) < alg_cfg.tol:
+                break
+
+    a = best_a
+    W = best_W if best_W is not None else W
+    F = compute_F(a, Phi)
     return {
-        "W": W, "A": np.diag(a), "a": a, "F": compute_F(a, Phi),
+        "W": W, "A": np.diag(a), "a": a, "F": F,
         "history": history,
     }

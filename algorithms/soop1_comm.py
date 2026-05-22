@@ -82,18 +82,98 @@ def _zf_waterfilling(H: np.ndarray, F: np.ndarray, sigma2: float, Pt: float
 
 def _sp2_inner(a_init: np.ndarray, H: np.ndarray, Phi: np.ndarray,
                W: np.ndarray, sigma2: float, Kc: int,
+               iters: int = 10, pgd_steps: int = 20,
+               ) -> Tuple[np.ndarray, list]:
+    """
+    Two-level inner loop for SP2 (amplitude update) — Algorithm 1.
+
+    Outer loop (t = 0..iters-1): refreshes mu*, xi*, Q_bar, u_bar at best_a.
+    Inner loop (s = 0..pgd_steps-1): Nesterov-accelerated PGD on the FIXED
+    surrogate g = u^T a - a^T Q a.  Momentum is reset each outer step.
+
+    Total PGD evaluations = iters * pgd_steps.
+    R is recorded after every inner PGD step  →  len(history) = iters * pgd_steps.
+
+    MM lower-bound chain:
+        g(a; a_0) <= R(a)  (tight at a_0)
+        ascending g  ⟹  ascending R
+    Lipschitz constant of ∇g = u - 2*Q*a:  L = 2 * lambda_max(Q_bar).
+    Correct PGD step:  alpha = 1 / (2 * lambda_max).
+    """
+    Mt = a_init.size
+    a = a_init.copy()
+    history = []
+
+    best_R = sum_rate(H, compute_F(a, Phi), W, sigma2, Kc)
+    best_a = a.copy()
+    v_eig  = None
+
+    for t in range(iters):
+        # Build surrogate at best-known iterate for the strongest MM guarantee
+        a = best_a.copy()
+
+        # ── Update mu*, xi* once per surrogate refresh ───────────────────────
+        F_t  = compute_F(a, Phi)
+        HF   = H @ F_t                                    # (Kc, N)
+        sig  = HF @ W                                     # (Kc, Kc+Ks)
+        abs2 = np.abs(sig) ** 2
+        mu = np.zeros(Kc)
+        xi = np.zeros(Kc, dtype=complex)
+        for k in range(Kc):
+            num        = abs2[k, k]
+            denom_int  = abs2[k, :].sum() - abs2[k, k] + sigma2
+            mu[k]      = num / max(denom_int, 1e-30)
+            denom_full = abs2[k, :].sum() + sigma2
+            xi[k]      = (np.sqrt(1 + mu[k]) * (HF[k] @ W[:, k])
+                          / max(denom_full, 1e-30))
+
+        # ── Build Q_bar, u_bar (Eq. 71-72) ───────────────────────────────────
+        Q_bar = np.zeros((Mt, Mt))
+        u_bar = np.zeros(Mt)
+        for k in range(Kc):
+            Dk    = H[k, :]                              # (Mt,)
+            DkPhi = Dk[:, None] * Phi                    # (Mt, N)
+            Qk    = DkPhi @ W                            # (Mt, Kc+Ks)
+            Q_bar += (np.abs(xi[k]) ** 2) * np.real(Qk @ Qk.conj().T)
+            u_bar += (2.0 * np.sqrt(1 + mu[k])
+                      * np.real((DkPhi @ W[:, k]) * np.conj(xi[k])))
+
+        # ── lambda_max via warm-started power iteration ───────────────────────
+        pi_iters = 40 if t == 0 else 15
+        lam_raw, v_eig = _power_iter_lambda_max(Q_bar, iters=pi_iters, v0=v_eig)
+        lam  = lam_raw * 1.05 + 1e-9
+        step = 1.0 / (2.0 * lam)   # L = 2*lambda_max(Q_bar)
+
+        # ── Nesterov-PGD on fixed surrogate (FISTA) ──────────────────────────
+        a_pgd  = a.copy()
+        a_prev = a.copy()
+        t_nest = 1.0
+        for s in range(pgd_steps):
+            t_next = (1.0 + np.sqrt(1.0 + 4.0 * t_nest ** 2)) / 2.0
+            iota   = (t_nest - 1.0) / t_next
+            v      = project_box(a_pgd + iota * (a_pgd - a_prev), 0.0, 1.0)
+
+            a_new  = project_box(v + step * (u_bar - 2.0 * (Q_bar @ v)), 0.0, 1.0)
+
+            a_prev = a_pgd
+            a_pgd  = a_new
+            t_nest = t_next
+
+            R_now = sum_rate(H, compute_F(a_pgd, Phi), W, sigma2, Kc)
+            history.append(R_now)
+            if R_now > best_R + 1e-9:
+                best_R = R_now
+                best_a = a_pgd.copy()
+
+    return best_a, history
+
+def _sp2_inner_v2(a_init: np.ndarray, H: np.ndarray, Phi: np.ndarray,
+               W: np.ndarray, sigma2: float, Kc: int,
                iters: int = 30, use_nesterov: bool = True
                ) -> Tuple[np.ndarray, list]:
     """
     Inner loop for SP2 (amplitude update) using FP + accelerated
     non-homogeneous quadratic transform.
-
-    The auxiliary variables (mu, xi) are updated **only at t=0** so that
-    the surrogate is fixed within the inner loop and we get strict
-    monotonic ascent of the surrogate (manuscript's accelerated quadratic
-    transform). Updating (mu, xi) every step turns the surrogate into a
-    different function each iteration and breaks monotonicity of the
-    original sum-rate.
 
     Returns
     -------
@@ -105,71 +185,82 @@ def _sp2_inner(a_init: np.ndarray, H: np.ndarray, Phi: np.ndarray,
     a_prev = a.copy()
     history = []
 
-    # ---- Update auxiliary variables ONCE per outer iteration ----
-    F = compute_F(a, Phi)
-    HF = H @ F                                       # (Kc, N)
-    sig = HF @ W                                     # (Kc, Kc + Ks)
-    abs2 = np.abs(sig) ** 2
-    mu = np.zeros(Kc)
-    xi = np.zeros(Kc, dtype=complex)
-    for k in range(Kc):
-        num = abs2[k, k]
-        denom_int = abs2[k, :].sum() - abs2[k, k] + sigma2
-        mu[k] = num / max(denom_int, 1e-30)
-        denom_full = abs2[k, :].sum() + sigma2
-        xi[k] = np.sqrt(1 + mu[k]) * (HF[k] @ W[:, k]) / max(denom_full, 1e-30)
-
-    # ---- Build Q_bar (PSD), u_bar (Eq. 71-72) ONCE ----
-    Q_bar = np.zeros((Mt, Mt))
-    u_bar = np.zeros(Mt)
-    for k in range(Kc):
-        Dk = H[k, :]                                 # (Mt,)
-        DkPhi = Dk[:, None] * Phi                    # (Mt, N)
-        Qk = DkPhi @ W                               # (Mt, Kc+Ks)
-        Q_bar += (np.abs(xi[k]) ** 2) * np.real(Qk @ Qk.conj().T)
-        u_bar += 2.0 * np.sqrt(1 + mu[k]) * np.real((DkPhi @ W[:, k])
-                                                    * np.conj(xi[k]))
-
-    # ---- Lipschitz constant: lambda >= lambda_max(Q_bar) ----
-    # Frobenius is a (often loose) upper bound; we use an estimate via a
-    # short power iteration to get a tighter (and still safe) value.
-    lam = _power_iter_lambda_max(Q_bar) * 1.01 + 1e-9
-
-    best_R = sum_rate(H, compute_F(a, Phi), W, sigma2, Kc)
-    best_a = a.copy()
-
     for t in range(1, iters + 1):
-        # ---- accelerated PGD (Eq. 79-80) ----
+        # Current F = diag(a) Phi
+        F = compute_F(a, Phi)
+
+        # ----- 1) update mu_k (Eq. 51) -----
+        HF = H @ F                                       # (Kc, N)
+        sig = HF @ W                                     # (Kc, Kc + Ks)
+        abs2 = np.abs(sig) ** 2
+        mu = np.zeros(Kc)
+        for k in range(Kc):
+            num = abs2[k, k]
+            denom = abs2[k, :].sum() - abs2[k, k] + sigma2
+            mu[k] = num / max(denom, 1e-30)
+
+        # ----- 2) update xi_k (Eq. 54) -----
+        xi = np.zeros(Kc, dtype=complex)
+        for k in range(Kc):
+            denom = (abs2[k, :].sum() + sigma2)
+            xi[k] = np.sqrt(1 + mu[k]) * (HF[k] @ W[:, k]) / max(denom, 1e-30)
+
+        # ----- 3) build Q_bar, u_bar (Eq. 71-72) -----
+        # D_k = diag(h_k); Q_k = D_k Phi W; total f1 quadratic form is
+        #     sum_k |xi_k|^2 Q_k Q_k^H ;
+        # in the manuscript, Q_bar = Re{ sum_k |xi_k|^2 Q_k Q_k^H }.
+        Q_bar = np.zeros((Mt, Mt))
+        u_bar = np.zeros(Mt)
+        for k in range(Kc):
+            Dk = H[k, :]                            # (Mt,)
+            DkPhi = Dk[:, None] * Phi              # (Mt, N)
+            Qk = DkPhi @ W                          # (Mt, Kc+Ks)
+            # |xi_k|^2 * Q_k Q_k^H
+            Q_bar += (np.abs(xi[k]) ** 2) * np.real(Qk @ Qk.conj().T)
+            # 2 sqrt(1+mu_k) Re{ D_k Phi w_k xi_k^* }
+            u_bar +=  np.sqrt(1 + mu[k]) * np.real((DkPhi @ W[:, k])
+                                                        * np.conj(xi[k]))
+
+        # ----- 4) accelerated PGD (Eq. 79-80) -----
+        # lambda >= lambda_max(Q_bar). Use Frobenius norm as upper bound.
+        lam = np.linalg.norm(Q_bar, ord='fro')
+        lam = max(lam, 1e-9)
+        # print(lam)
+        # lam =5e4
         if use_nesterov and t > 1:
             iota = max(0.0, (t - 2) / (t + 1))
             v = a + iota * (a - a_prev)
-            v = project_box(v, 0.0, 1.0)             # keep momentum feasible
         else:
             v = a.copy()
 
         grad_term = u_bar - Q_bar @ v
-        a_new = project_box(v + grad_term / lam, 0.0, 1.0)
-
+        # a_new = v + grad_term / lam
+        a_new =project_box(v + grad_term / lam, 0.0, 1.0)
+        # a_new =project_box(a + grad_term / lam, 0.0, 1.0)
+        # bookkeeping
         a_prev = a
         a = a_new
 
-        R_now = sum_rate(H, compute_F(a, Phi), W, sigma2, Kc)
-        history.append(R_now)
-        if R_now > best_R + 1e-9:
-            best_R = R_now
-            best_a = a.copy()
+        history.append(sum_rate(H, compute_F(a, Phi), W, sigma2, Kc))
 
-    # safeguard: return the best a seen (monotone-by-construction)
-    return best_a, history
+    return a, history
 
+def _power_iter_lambda_max(M: np.ndarray, iters: int = 25,
+                           v0: np.ndarray = None
+                           ) -> Tuple[float, np.ndarray]:
+    """
+    Estimate lambda_max of a symmetric PSD matrix via power iteration.
 
-def _power_iter_lambda_max(M: np.ndarray, iters: int = 25) -> float:
-    """Estimate the largest eigenvalue of a symmetric PSD matrix."""
+    Returns (lambda_max_estimate, final_eigenvector).
+    Pass v0 to warm-start from a previous call's eigenvector.
+    """
     n = M.shape[0]
     if n == 0:
-        return 0.0
-    rng = np.random.default_rng(0)
-    v = rng.standard_normal(n)
+        return 0.0, np.ones(1)
+    if v0 is None:
+        v = np.random.default_rng(0).standard_normal(n)
+    else:
+        v = v0.copy()
     v /= np.linalg.norm(v) + 1e-12
     lam = 0.0
     for _ in range(iters):
@@ -177,81 +268,95 @@ def _power_iter_lambda_max(M: np.ndarray, iters: int = 25) -> float:
         nv = np.linalg.norm(v) + 1e-12
         lam = nv
         v = v / nv
-    return float(lam)
+    return float(lam), v
 
 
-def solve_SOOP1(scenario, sys_cfg, alg_cfg) -> Dict:
+def solve_SOOP1(scenario, sys_cfg, alg_cfg,
+                full_history: bool = False) -> Dict:
     """
     Run Algorithm 1 on a given scenario.
 
-    Returns dict with W, A, history (list of sum-rates over outer iters).
+    Parameters
+    ----------
+    full_history : bool
+        When True, disables early stopping and additionally stores
+        ``history["inner_sum_rate"]``: a list of length outer_iters,
+        where each element is ``[R_after_WF, R_inner_1, ..., R_inner_T]``
+        — the R right after the ZF+WF step, then R after each inner PGD
+        step.  Unroll across outer iters to get the fine-grained curve.
+
+    Returns
+    -------
+    dict with W, A, a, F, history.
+    history always contains "sum_rate" and "sensing_mi" (per outer iter).
+    With full_history=True it also contains "inner_sum_rate".
     """
+    from .utils import sensing_mi as _smi
     rng = np.random.default_rng(sys_cfg.seed + 7)
     Mt, N = scenario.Mt, scenario.N
     Kc, Ks = scenario.Kc, scenario.Ks
-    Pt = sys_cfg.Pt
+    Pt     = sys_cfg.Pt
     sigma2 = sys_cfg.sigma2
+    Phi    = scenario.Phi
+    W_s    = np.zeros((N, Ks), dtype=complex)
 
-    a = rng.uniform(0.3, 1.0, size=Mt)
-    Phi = scenario.Phi
-
-    # Sensing precoder is zero in communication-centric design
-    W_s = np.zeros((N, Ks), dtype=complex)
+    a = rng.uniform(0, 1.0, size=Mt)
 
     history = {"sum_rate": [], "sensing_mi": []}
+    if full_history:
+        history["inner_sum_rate"] = []
+
     # initial digital BF
-    F = compute_F(a, Phi)
+    F    = compute_F(a, Phi)
     W_c, _ = _zf_waterfilling(scenario.H, F, sigma2, Pt)
-    W = np.concatenate([W_c, W_s], axis=1)
+    W    = np.concatenate([W_c, W_s], axis=1)
     R_best = sum_rate(scenario.H, F, W, sigma2, Kc)
     a_best, W_best = a.copy(), W.copy()
 
     for it in range(alg_cfg.outer_iters):
-        # baseline at the start of this outer iteration
-        R_curr = sum_rate(scenario.H, compute_F(a, Phi), W, sigma2, Kc)
-
-        # ---- (a) Digital BF: ZF + water-filling on current F ----
-        F = compute_F(a, Phi)
+        # ---- SP1: ZF + water-filling on current a -------------------------
+        F    = compute_F(a, Phi)
         W_c, _ = _zf_waterfilling(scenario.H, F, sigma2, Pt)
-        W = np.concatenate([W_c, W_s], axis=1)
-        # ZF + water-filling is the global optimum of SP1 for given a.
+        W    = np.concatenate([W_c, W_s], axis=1)
+        R_after_wf = sum_rate(scenario.H, F, W, sigma2, Kc)
 
-        # ---- (b) Holographic BF: SP2 ----
-        a_new, sp2_hist = _sp2_inner(a, scenario.H, Phi, W, sigma2, Kc,
+        # ---- SP2: amplitude update ----------------------------------------
+        surr_iters = max(1, alg_cfg.inner_iters // alg_cfg.pgd_steps)
+        a_new, sp2_hist = _sp2_inner_v2(a, scenario.H, Phi, W, sigma2, Kc,
                                      iters=alg_cfg.inner_iters,
-                                     use_nesterov=alg_cfg.nesterov)
-        if sp2_hist:
-            print(f"  [SOOP1 it={it}] SP2 R: {sp2_hist[0]:.4f} -> {sp2_hist[-1]:.4f}"
-                  f"  (delta={sp2_hist[-1]-sp2_hist[0]:+.4f})")
+                                    #  pgd_steps=alg_cfg.pgd_steps
+                                     )
 
-        # BCD-correct: re-solve SP1 at the new a, then compare vs start-of-iter
-        F_new = compute_F(a_new, Phi)
+        if full_history:
+            history["inner_sum_rate"].append([R_after_wf] + sp2_hist)
+
+        # BCD-correct: re-solve SP1 at new a to get the true objective value
+        F_new   = compute_F(a_new, Phi)
         W_c_new, _ = _zf_waterfilling(scenario.H, F_new, sigma2, Pt)
-        W_new = np.concatenate([W_c_new, W_s], axis=1)
-        R_new = sum_rate(scenario.H, F_new, W_new, sigma2, Kc)
+        W_new   = np.concatenate([W_c_new, W_s], axis=1)
+        R_new   = sum_rate(scenario.H, F_new, W_new, sigma2, Kc)
 
+        R_curr  = sum_rate(scenario.H, F, W, sigma2, Kc)
         if R_new >= R_curr - 1e-9:
             a, W = a_new, W_new
-        # else: keep a and W from SP1 block (rare in well-tuned BCD)
+        # else: keep current a, W (rare)
 
-        F = compute_F(a, Phi)
+        F     = compute_F(a, Phi)
         R_now = sum_rate(scenario.H, F, W, sigma2, Kc)
         history["sum_rate"].append(R_now)
-        from .utils import sensing_mi as _smi
-        history["sensing_mi"].append(_smi(scenario.Bt_s, scenario.gamma_s2,
-                                          F, W, sys_cfg.sigma_s2,
-                                          sys_cfg.L, scenario.Mr))
+        history["sensing_mi"].append(
+            _smi(scenario.Bt_s, scenario.gamma_s2,
+                 F, W, sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr))
 
         if R_now > R_best:
             R_best = R_now
             a_best, W_best = a.copy(), W.copy()
 
-        # convergence (tighter tolerance to avoid premature stop)
-        if it > 1 and abs(history["sum_rate"][-1]
-                          - history["sum_rate"][-2]) < 1e-6:
-            break
+        if not full_history:
+            if it > 1 and abs(history["sum_rate"][-1]
+                              - history["sum_rate"][-2]) < 1e-6:
+                break
 
-    # always return the best iterate seen
     a, W = a_best, W_best
     F = compute_F(a, Phi)
     return {

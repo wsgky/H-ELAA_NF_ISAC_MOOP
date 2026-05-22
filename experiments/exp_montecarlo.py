@@ -22,11 +22,11 @@ from experiments.runner import RESULTS_DIR, _to_jsonable, run_one_trial
 
 def main(n_trials: int = 50):
     sys_cfg = SystemConfig(
-        Mt_h=16, Mt_v=16, Mr_h=16, Mr_v=16, N=8,
+        Mt_h=256, Mt_v=8, Mr_h=256, Mr_v=8, N=8,
         Kc=3, Ks=2, Ke=2, L=128, seed=2025,
         rhs_structure="subarray",
     )
-    alg_cfg = AlgorithmConfig(outer_iters=8, inner_iters=15)
+    alg_cfg = AlgorithmConfig(outer_iters=15, inner_iters=40)
     omega_list = [(0.2, 0.8), (0.5, 0.5), (0.8, 0.2)]
 
     print(f"[exp_montecarlo] {n_trials} trials | "
