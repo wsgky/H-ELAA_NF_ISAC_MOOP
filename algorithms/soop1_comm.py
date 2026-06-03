@@ -313,7 +313,7 @@ def solve_SOOP1(scenario, sys_cfg, alg_cfg,
     R_best = sum_rate(scenario.H, F, W, sigma2, Kc)
     a_best, W_best = a.copy(), W.copy()
 
-    for it in range(alg_cfg.outer_iters):
+    for it in range(alg_cfg.SOOP1_outer_iters):
         # ---- SP1: ZF + water-filling on current a -------------------------
         F    = compute_F(a, Phi)
         W_c, _ = _zf_waterfilling(scenario.H, F, sigma2, Pt)
@@ -321,9 +321,9 @@ def solve_SOOP1(scenario, sys_cfg, alg_cfg,
         R_after_wf = sum_rate(scenario.H, F, W, sigma2, Kc)
 
         # ---- SP2: amplitude update ----------------------------------------
-        surr_iters = max(1, alg_cfg.inner_iters // alg_cfg.pgd_steps)
+        surr_iters = max(1, alg_cfg.SOOP1_inner_iters // alg_cfg.pgd_steps)
         a_new, sp2_hist = _sp2_inner_v2(a, scenario.H, Phi, W, sigma2, Kc,
-                                     iters=alg_cfg.inner_iters,
+                                     iters=alg_cfg.SOOP1_inner_iters,
                                     #  pgd_steps=alg_cfg.pgd_steps
                                      )
 

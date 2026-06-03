@@ -21,9 +21,15 @@ Pipeline (manuscript Sec. V-C):
        This is convex in {w_i}.
     2) For given W, update aux. variables and run a Lagrangian-dual
        loop (Eq. 95-105) over (a, lambda_1, lambda_2):
-         - update a by projected gradient ascent on the Lagrangian
+         - propose a by projected gradient ascent on the Lagrangian, then
+           ACCEPT it via a monotonic backtracking line search on the original
+           Tchebycheff objective tau (shrink the step until tau does not
+           decrease). This is what guarantees the inner sequence is monotone;
+           a plain PGD step does not.
          - update lambda_1 by projected gradient on g(lambda_1)
          - lambda_2 = (omega2 / I*) (1 - lambda_1 R*/omega1)
+
+R*, I* are FIXED reference values throughout the MOOP iterations.
 """
 import numpy as np
 try:
@@ -167,9 +173,15 @@ def _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev, omega1, omega2,
 # SP5 : digital BF (CVX)
 # =====================================================================
 def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
-               omega1, omega2):
+               omega1, omega2, outer_iter: int = 0):
     """
-    Digital sub-problem with fixed amplitudes a. Returns updated W.
+    Digital sub-problem with fixed amplitudes a (pseudocode lines 4-12).
+
+    Adaptive SCA loop with two stopping criteria:
+      1. n_sca(s) = max(1, round(sp5_iters / (1 + sp5_decay * s)))
+         More steps in early outer iters, fewer in later ones.
+      2. ΔW early-stop: if relative W change < sp5_tol, SCA has converged.
+    Returns (W, tau).
     """
     Phi = scenario.Phi
     H = scenario.H
@@ -184,106 +196,110 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
     F = compute_F(a, Phi)
     HF = H @ F                                     # (Kc, N)
 
-    if not _HAVE_CVX:
-        # ---- fallback: projected gradient ascent on the smoothed
-        # Tchebycheff objective ----
-        return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
-                             omega1, omega2, R_star, I_star)
+    # if not _HAVE_CVX:
+    #     return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
+    #                          omega1, omega2, R_star, I_star)
 
-    # ---- compute aux variables mu*, xi* with the previous W ----
-    sig = HF @ W_prev                              # (Kc, Kc+Ks)
-    abs2 = np.abs(sig) ** 2
-    mu = np.zeros(Kc)
-    xi = np.zeros(Kc, dtype=complex)
-    for k in range(Kc):
-        num = abs2[k, k]
-        denom = abs2[k, :].sum() - abs2[k, k] + sigma2
-        mu[k] = num / max(denom, 1e-30)
-        denom2 = abs2[k, :].sum() + sigma2
-        xi[k] = np.sqrt(1 + mu[k]) * (HF[k] @ W_prev[:, k]) / max(denom2, 1e-30)
+    R_star = max(R_star, 1e-9)
+    I_star = max(I_star, 1e-9)
 
-    # ---- z_i = w_i^{(prev)} (Eq. 89, choice z = a) ----
-    Z_prev = W_prev.copy()                         # (N, Kc+Ks)
+    # ── adaptive SCA budget: decreases harmonically with outer iteration ──
+    # sp5_iters_max = getattr(alg_cfg, 'sp5_iters', 1)
+    # sp5_decay     = getattr(alg_cfg, 'sp5_decay', 1.0)
+    # sp5_tol       = getattr(alg_cfg, 'sp5_tol',   1e-3)
+    sp5_tol=alg_cfg.sp5_tol
+    # n_sca = max(1, round(sp5_iters_max / (1.0 + sp5_decay * outer_iter)))
 
-    # ---- coefficients for f1_k(w) (linear+quadratic in W) ----
-    # f1_k = log(1+mu_k) - mu_k - |xi_k|^2 sigma_k^2
-    #        + 2 sqrt(1+mu_k) Re{ h_k F w_k xi_k^* }
-    #        - |xi_k|^2 || h_k F W ||^2
-    # The first two terms are constants for the optimisation.
-
-    # ---- coefficients for g2 (Eq. 90) ----
-    # G_k = g_k g_k^H,  g_k = sqrt(gamma_k^2) F^H b_k
+    # g_vecs depend only on F (fixed in SP5), pre-compute once
     g_vecs = np.zeros((N, Ks), dtype=complex)
     for k in range(Ks):
         g_vecs[:, k] = np.sqrt(scenario.gamma_s2[k]) * (F.conj().T @ scenario.Bt_s[:, k])
 
-    # ---- CVX variables ----
-    # Stack W as (N, Kc+Ks) complex variable
-    W_var = cp.Variable((N, Kc + Ks), complex=True)
-    tau = cp.Variable()
+    W_curr = scale_W_to_power(F, W_prev.copy(), Pt)
+    tau_val = None
+    success = False
 
-    # f1_k builder
-    f1_terms = []
-    for k in range(Kc):
-        const_k = float(np.log(1 + mu[k]) - mu[k] - (np.abs(xi[k]) ** 2) * sigma2)
-        # 2 sqrt(1+mu_k) Re{ (h_k F) w_k xi_k^* }
-        hF_k = HF[k, :]                           # (N,)
-        lin = 2.0 * np.sqrt(1 + mu[k]) * cp.real(
-            cp.conj(xi[k]) * (hF_k @ W_var[:, k])
-        )
-        # |xi_k|^2 || h_k F W ||^2  =  |xi_k|^2 * sum_j |hF_k @ w_j|^2
-        # (hF_k @ W_var) is a 1-by-(Kc+Ks) row vector
-        row = hF_k @ W_var                       # row vector
-        quad = (np.abs(xi[k]) ** 2) * cp.sum_squares(row)
-        f1_terms.append(const_k + lin - quad)
+    # ── SCA inner loop: for i in [1 : n_sca]  (pseudocode lines 5-11) ────
+    for _ in range(alg_cfg.sp5_iters):
+        # lines 6-8: update mu_k*, xi_k*, z_k = w_k^{(i-1)}
+        sig  = HF @ W_curr
+        abs2 = np.abs(sig) ** 2
+        mu = np.zeros(Kc)
+        xi = np.zeros(Kc, dtype=complex)
+        for k in range(Kc):
+            num    = abs2[k, k]
+            denom  = abs2[k, :].sum() - abs2[k, k] + sigma2
+            mu[k]  = num / max(denom, 1e-30)
+            denom2 = abs2[k, :].sum() + sigma2
+            xi[k]  = (np.sqrt(1 + mu[k]) * (HF[k] @ W_curr[:, k])
+                      / max(denom2, 1e-30))
 
-    f1_sum = cp.sum(f1_terms)
+        Z_prev = W_curr.copy()                     # z_k^{(i)} = w_k^{(i-1)}
 
-    # g2 builder
-    # log(1 + sum_i 2 Re{z_i^H G_k w_i} - z_i^H G_k z_i),  k = 1..Ks.
-    g2_terms = []
-    for k in range(Ks):
-        gk = g_vecs[:, k]                         # (N,)
-        lin_g = 0
-        const_g = 0
-        for i in range(Kc + Ks):
-            zi = Z_prev[:, i]
-            # z_i^H g_k g_k^H w_i = (z_i^H g_k)*(g_k^H w_i)  -- scalar
-            ai = np.conj(zi) @ gk                 # scalar
-            # 2 Re{ ai^* * (g_k^H w_i) }
-            lin_g = lin_g + 2.0 * cp.real(np.conj(ai) * (gk.conj() @ W_var[:, i]))
-            const_g += float(np.abs(ai) ** 2)
-        coef_k = (L * Mr * scenario.gamma_s2[k]) / sigma_s2
-        g2_terms.append(cp.log1p(coef_k * (lin_g - const_g)))
-    g2_sum = cp.sum(g2_terms)
+        # line 10: solve problem (60) — build CVX surrogate and solve
+        W_var = cp.Variable((N, Kc + Ks), complex=True)
+        tau   = cp.Variable()
 
-    # ---- power constraint: Tr(F W W^H F^H) = || F W ||_F^2 ----
-    FW = F @ W_var
-    pow_con = cp.sum_squares(FW) <= Pt
+        # f1_k: communication FP surrogate (Eq. 88)
+        f1_terms = []
+        for k in range(Kc):
+            const_k = float(
+                np.log(1 + mu[k]) - mu[k] - (np.abs(xi[k]) ** 2) * sigma2)
+            hF_k = HF[k, :]
+            lin  = 2.0 * np.sqrt(1 + mu[k]) * cp.real(
+                cp.conj(xi[k]) * (hF_k @ W_var[:, k]))
+            row  = hF_k @ W_var
+            quad = (np.abs(xi[k]) ** 2) * cp.sum_squares(row)
+            f1_terms.append(const_k + lin - quad)
+        f1_sum = cp.sum(f1_terms)
 
-    # ---- the two scalarisation constraints ----
-    R_star = max(R_star, 1e-9)
-    I_star = max(I_star, 1e-9)
-    cons = [
-        f1_sum >= (tau / omega1 + 1.0) * R_star * np.log(2.0),  # convert log2->ln
-        g2_sum >= (tau / omega2 + 1.0) * I_star * np.log(2.0),
-        pow_con,
-    ]
+        # g2: sensing FP surrogate (Eq. 90)
+        g2_terms = []
+        for k in range(Ks):
+            gk      = g_vecs[:, k]
+            lin_g   = 0
+            const_g = 0.0
+            for i in range(Kc + Ks):
+                zi      = Z_prev[:, i]
+                ai      = np.conj(zi) @ gk
+                lin_g   = lin_g + 2.0 * cp.real(
+                    np.conj(ai) * (gk.conj() @ W_var[:, i]))
+                const_g += float(np.abs(ai) ** 2)
+            # coef_k = (L * Mr * scenario.gamma_s2[k]) / sigma_s2
+            coef_k = (L * Mr ) / sigma_s2
+            g2_terms.append(cp.log1p(coef_k * (lin_g - const_g)))
+        g2_sum = cp.sum(g2_terms)
 
-    prob = cp.Problem(cp.Maximize(tau), cons)
-    try:
-        prob.solve(solver=alg_cfg.cvx_solver, verbose=alg_cfg.cvx_verbose)
-    except Exception:
-        prob.solve(solver="SCS", verbose=False)
+        cons = [
+            f1_sum >= (tau / omega1 + 1.0) * R_star * np.log(2.0),
+            g2_sum >= (tau / omega2 + 1.0) * I_star * np.log(2.0),
+            cp.sum_squares(F @ W_var) <= Pt,
+        ]
+        prob = cp.Problem(cp.Maximize(tau), cons)
+        try:
+            prob.solve(solver=alg_cfg.cvx_solver, verbose=alg_cfg.cvx_verbose)
+        except Exception:
+            prob.solve(solver="SCS", verbose=False)
 
-    if W_var.value is None:
-        # CVX failed: fall back to gradient ascent on the smoothed objective
+        if W_var.value is None:
+            break                                  # CVX failed; use best W so far
+
+        W_new   = scale_W_to_power(F, np.asarray(W_var.value), Pt)
+        # W_new   = np.asarray(W_var.value)
+        tau_val = float(tau.value) if tau.value is not None else tau_val
+
+        # ΔW early-stop: if W barely changed, further SCA steps won't help
+        rel_dW = (np.linalg.norm(W_new - W_curr, 'fro')
+                  / max(np.linalg.norm(W_curr, 'fro'), 1e-9))
+        W_curr  = W_new
+        success = True
+        if rel_dW < sp5_tol:
+            break                                  # SCA converged; stop early
+
+    if not success:
         return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
                              omega1, omega2, R_star, I_star)
-    W_new = np.asarray(W_var.value)
-    # safety
-    W_new = scale_W_to_power(F, W_new, Pt)
-    return W_new, float(tau.value) if tau.value is not None else None
+    return W_curr, tau_val
 
 
 # =====================================================================
@@ -291,7 +307,8 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
 # =====================================================================
 def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
                omega1, omega2,
-               lam1_init: float = None, lam2_init: float = None):
+               lam1_init: float = None, lam2_init: float = None,
+               full_history: bool = False):
     """
     Amplitude sub-problem with fixed W. Lagrangian-dual ascent on
     (a, lambda_1, lambda_2).
@@ -308,12 +325,31 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
     a = a_init.copy()
     R_star = max(R_star, 1e-9)
     I_star = max(I_star, 1e-9)
+    inner_hist = {
+        "R": [], "I": [], "duality_gap": [],
+        "lam1": [], "lam2": [],
+        "grad_norm": [], "da_norm": [],
+    } if full_history else None
 
     # initial duals
     lam1_max = omega1 / R_star
     lam1 = lam1_init if lam1_init is not None else 0.5 * lam1_max
     lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
     lam2 = max(lam2, 0.0)
+
+    # best-iterate tracking: SP6 returns the highest-τ a seen, not the last
+    def _tau_sp6(R, I):
+        return min(omega1 * (R - R_star) / R_star,
+                   omega2 * (I - I_star) / I_star)
+
+    F0 = compute_F(a_init, Phi)
+    R0_sp6 = sum_rate(scenario.H, F0, W, sigma2, Kc)
+    I0_sp6 = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F0, W,
+                        sigma_s2, sys_cfg.L, Mr)
+    best_tau_sp6  = _tau_sp6(R0_sp6, I0_sp6)
+    best_a_sp6    = a_init.copy()
+    best_lam1_sp6 = lam1
+    best_lam2_sp6 = lam2
 
     # ---- pre-compute pieces that don't depend on a ----
     # Q_bar(W), u_bar(W) for the comm surrogate (Eq. 71-72)
@@ -330,10 +366,27 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
         coeff_sens.append((L * Mr * scenario.gamma_s2[k]) / sigma_s2)
 
     # ---- inner loop on a, lam1 ----
-    for t in range(alg_cfg.inner_iters):
-        # Update mu*, xi* (Lemma 1, Eq. 51, 54)
+    # Each step does a projected-gradient ascent on the Lagrangian, but the
+    # candidate amplitude is accepted ONLY if it does not decrease the
+    # *original* Tchebycheff objective tau (monotonic backtracking line
+    # search). A plain PGD step is not a strict MM/SCA update and can lower
+    # the original objective even when the surrogate looks fine; the
+    # backtracking makes the SP6 inner sequence monotone non-decreasing in tau.
+    bt_beta      = getattr(alg_cfg, "bt_beta", 0.5)
+    bt_max       = getattr(alg_cfg, "bt_max", 20)
+    patience_max = getattr(alg_cfg, "MOOP_inner_patience", 15)
+    no_progress  = 0
+
+    for t in range(alg_cfg.MOOP_inner_iters):
+        # ---- original objective at the current iterate (R*, I* are FIXED) ----
         F = compute_F(a, Phi)
         HF = H @ F
+        R_cur = sum_rate(scenario.H, F, W, sigma2, Kc)
+        I_cur = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
+                           sigma_s2, sys_cfg.L, Mr)
+        tau_cur = _tau_sp6(R_cur, I_cur)
+
+        # Update mu*, xi* (Lemma 1, Eq. 51, 54)
         sig = HF @ W
         abs2 = np.abs(sig) ** 2
         mu = np.zeros(Kc)
@@ -366,37 +419,85 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
         z = a.copy()
         grad_sens = np.zeros(Mt)
         for k in range(Ks):
-            Qk = Q_sens[k]
             ck = coeff_sens[k]
+            Qk = ck * Q_sens[k]
             Qkz = Qk @ z
             zQz = float(np.real(z @ Qkz))
             zQa = float(np.real(z @ (Qk @ a)))
-            denom = 1.0 + ck * (2.0 * zQa - zQz)
-            grad_sens += ck * 2.0 * np.real(Qkz) / max(denom, 1e-12)
+            denom = 1.0 - zQz + 2.0 * zQa
+            grad_sens +=  2.0 * np.real(Qkz) / max(denom, 1e-12)
         grad_sens *= lam2
 
-        grad_psi = grad_comm + grad_sens
+        grad_psi  = grad_comm + grad_sens
+        grad_norm = float(np.linalg.norm(grad_psi))
 
-        # adaptive step (rescale)
-        step_a = alg_cfg.pgd_step_a / (1.0 + np.linalg.norm(grad_psi) / max(Mt, 1))
-        a = project_box(a + step_a * grad_psi, 0.0, 1.0)
+        # ---- monotonic backtracking line search on the ORIGINAL tau ----
+        #   a_cand = P_[0,1]( a + step * grad_psi );  accept iff
+        #   tau(W, a_cand) >= tau(W, a),  else  step <- bt_beta * step.
+        a_prev = a.copy()
+        step = alg_cfg.pgd_step_a / (1.0 + grad_norm / max(Mt, 1))
+        R_now, I_now, tau_now = R_cur, I_cur, tau_cur
+        accepted = False
+        for _bt in range(bt_max):
+            a_cand = project_box(a_prev + step * grad_psi, 0.0, 1.0)
+            F_cand = compute_F(a_cand, Phi)
+            R_cand = sum_rate(scenario.H, F_cand, W, sigma2, Kc)
+            I_cand = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_cand, W,
+                                sigma_s2, sys_cfg.L, Mr)
+            tau_cand = _tau_sp6(R_cand, I_cand)
+            if tau_cand >= tau_cur - 1e-12:
+                a = a_cand
+                R_now, I_now, tau_now = R_cand, I_cand, tau_cand
+                accepted = True
+                break
+            step *= bt_beta
+        # if no step improves tau, keep a unchanged (stall); tau stays put
+        da_norm = float(np.linalg.norm(a - a_prev))
 
         # ---- update lambda_1 via projected gradient on the dual function ----
-        F = compute_F(a, Phi)
-        # current f1_sum / log2 sum_rate
-        # f1_sum is in nats; scale R* by ln(2) to compare with our log2 R_star
-        R_now = sum_rate(scenario.H, F, W, sigma2, Kc)
-        I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
-                           sigma_s2, sys_cfg.L, Mr)
-        # dg/dlam1 = (R_now - R*) - (omega2 R*) / (omega1 I*) * (I_now - I*)
+        # (uses original R, I at the accepted amplitude)
         d_lam1 = (R_now - R_star) - (omega2 * R_star) / (omega1 * I_star) \
             * (I_now - I_star)
-        lam1 = lam1 - alg_cfg.pgd_step_lambda * d_lam1
-        lam1 = float(np.clip(lam1, 0.0, lam1_max))
-        lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
-        lam2 = max(lam2, 0.0)
+        lam1 = float(np.clip(lam1 - alg_cfg.pgd_step_lambda * d_lam1,
+                             0.0, lam1_max))
+        lam2 = max((omega2 / I_star) * (1.0 - lam1 * R_star / omega1), 0.0)
 
-    return a, lam1, lam2
+        # ---- convergence gap ----
+        # The previous Lagrangian "duality gap" was ill-signed (it evaluated
+        # tau_now - (tau_now + lam1) = -lam1 <= 0, so the stop test could fire
+        # falsely) and was not a true dual function g(lambda)=sup_a L either.
+        # With the monotone acceptance above, the honest, non-negative
+        # convergence measure is the per-step improvement of the original
+        # objective,  gap = tau^(t) - tau^(t-1) >= 0,  which -> 0 at a
+        # stationary point.
+        gap = max(tau_now - tau_cur, 0.0)
+
+        # best-iterate safeguard (under monotone acceptance, best == latest)
+        if tau_now > best_tau_sp6:
+            best_tau_sp6  = tau_now
+            best_a_sp6    = a.copy()
+            best_lam1_sp6 = lam1
+            best_lam2_sp6 = lam2
+
+        if full_history:
+            inner_hist["R"].append(R_now)
+            inner_hist["I"].append(I_now)
+            inner_hist["duality_gap"].append(gap)
+            inner_hist["lam1"].append(lam1)
+            inner_hist["lam2"].append(lam2)
+            inner_hist["grad_norm"].append(grad_norm)
+            inner_hist["da_norm"].append(da_norm)
+
+        # ---- early stop: tau has stopped improving for `patience` steps ----
+        if (not accepted) or gap < alg_cfg.tol:
+            no_progress += 1
+        else:
+            no_progress = 0
+        if no_progress >= patience_max:
+            break
+
+    # Return the best iterate seen (== latest under monotone acceptance)
+    return best_a_sp6, best_lam1_sp6, best_lam2_sp6, inner_hist
 
 
 # =====================================================================
@@ -405,7 +506,8 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
 def solve_MOOP(scenario, sys_cfg, alg_cfg,
                omega1: float = None, omega2: float = None,
                R_star: float = None, I_star: float = None,
-               soop1_result=None, soop2_result=None):
+               soop1_result=None, soop2_result=None,
+               full_history: bool = False):
     """
     Run Algorithm 3 (MOOP). If R*, I* are not provided, run SOOP1/SOOP2
     first to get them.
@@ -434,7 +536,7 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
     Pt = sys_cfg.Pt
 
     # init: warm-start with a uniform amplitude and a feasible W
-    a = rng.uniform(0.5, 1.0, size=Mt)
+    a = rng.uniform(0.0, 1.0, size=Mt)
 
     F = compute_F(a, Phi)
     # Use SOOP1 + SOOP2 W as warm-start: average them after EVD-fix to N
@@ -451,10 +553,19 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
     W = scale_W_to_power(F, W, Pt)
 
     history = {"sum_rate": [], "sensing_mi": [], "tau": []}
-    lam1_init = None
-
+    if full_history:
+        history["inner_R"] = []
+        history["inner_I"] = []
+        history["inner_tau"] = []
+        history["inner_duality_gap"] = []
+        # SP6-only per-inner-step detail (no SP5 prefix)
+        history["sp6_lam1"] = []
+        history["sp6_lam2"] = []
+        history["sp6_grad_norm"] = []
+        history["sp6_da_norm"] = []
     R_star_safe = max(R_star, 1e-9)
     I_star_safe = max(I_star, 1e-9)
+    lam1_init   = None           # warm-started from SP6's best lam1 each outer iter
 
     def _tau(R, I):
         return min(omega1 * (R - R_star_safe) / R_star_safe,
@@ -468,18 +579,47 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
     best_a, best_W = a.copy(), W.copy()
     best_R, best_I = R0, I0
 
-    for it in range(alg_cfg.outer_iters):
+    outer_tol     = getattr(alg_cfg, 'MOOP_outer_tol',     1e-4)
+    outer_patience = getattr(alg_cfg, 'MOOP_outer_patience', 5)
+    no_progress   = 0          # consecutive outer iters with Δτ < outer_tol
+
+    for it in range(alg_cfg.MOOP_outer_iters):
         a_prev_iter, W_prev_iter = a.copy(), W.copy()
-        # SP5
+
+        # SP5: adaptive SCA loop; n_sca decreases with outer iter s=it
         W_new, tau_val = _solve_SP5(scenario, sys_cfg, alg_cfg,
-                                    a, W, R_star, I_star, omega1, omega2)
+                                    a, W, R_star, I_star, omega1, omega2,
+                                    outer_iter=it)
         F = compute_F(a, Phi)
-        W_new = scale_W_to_power(F, W_new, Pt)
-        # SP6
-        a_new, lam1_init, _ = _solve_SP6(scenario, sys_cfg, alg_cfg,
-                                         a, W_new, R_star, I_star,
-                                         omega1, omega2, lam1_init=lam1_init)
+        # W_new = scale_W_to_power(F, W_new, Pt)
+
+        # SP5 checkpoint for fine-grained history (before SP6 moves a)
+        if full_history:
+            R_sp5 = sum_rate(scenario.H, F, W_new, sys_cfg.sigma2, Kc)
+            I_sp5 = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W_new,
+                               sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
+
+        # SP6: inner loop (for t in [1:T], pseudocode lines 17-30)
+        # lam1_init warm-starts from SP6's best lam1 of the previous outer iter
+        a_new, lam1_init, _, sp6_hist = _solve_SP6(
+            scenario, sys_cfg, alg_cfg,
+            a, W_new, R_star, I_star,
+            omega1, omega2, lam1_init=lam1_init,
+            full_history=full_history)
         F_new = compute_F(a_new, Phi)
+
+        if full_history and sp6_hist is not None:
+            outer_R   = [R_sp5] + sp6_hist["R"]
+            outer_I   = [I_sp5] + sp6_hist["I"]
+            outer_gap = [float("nan")] + sp6_hist["duality_gap"]
+            history["inner_R"].append(outer_R)
+            history["inner_I"].append(outer_I)
+            history["inner_tau"].append([_tau(r, i) for r, i in zip(outer_R, outer_I)])
+            history["inner_duality_gap"].append(outer_gap)
+            history["sp6_lam1"].append(sp6_hist["lam1"])
+            history["sp6_lam2"].append(sp6_hist["lam2"])
+            history["sp6_grad_norm"].append(sp6_hist["grad_norm"])
+            history["sp6_da_norm"].append(sp6_hist["da_norm"])
         W_new = scale_W_to_power(F_new, W_new, Pt)
 
         R_new = sum_rate(scenario.H, F_new, W_new, sys_cfg.sigma2, Kc)
@@ -505,17 +645,28 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_now, W,
                                sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
 
-        print(f"  [MOOP it={it}] R={R_now:.3f} I={I_now:.3f} tau={tau_new:.4f}"
+        # Record tau of the RETAINED point so the coarse history stays
+        # consistent with sum_rate/sensing_mi (and monotone non-decreasing).
+        # Appending the candidate tau_new on a reject step is what made the
+        # accepted-outer tau curve appear to drop.
+        tau_now = _tau(R_now, I_now)
+        print(f"  [MOOP it={it}] R={R_now:.3f} I={I_now:.3f} tau={tau_now:.4f}"
               f"  ||da||={da:.4f} ||dW||_F={dW:.4f}")
 
         history["sum_rate"].append(R_now)
         history["sensing_mi"].append(I_now)
-        history["tau"].append(tau_new)
+        history["tau"].append(tau_now)
 
-        if it > 1:
-            d1 = abs(history["sum_rate"][-1] - history["sum_rate"][-2])
-            d2 = abs(history["sensing_mi"][-1] - history["sensing_mi"][-2])
-            if d1 < alg_cfg.tol and d2 < alg_cfg.tol:
+        # ── outer-loop early stopping: Δτ < outer_tol for outer_patience iters ──
+        if it > 0:
+            delta_tau = history["tau"][-1] - history["tau"][-2]
+            if delta_tau < outer_tol:
+                no_progress += 1
+            else:
+                no_progress = 0
+            if no_progress >= outer_patience:
+                print(f"  [MOOP] outer stopped: Δτ < {outer_tol:.0e} "
+                      f"for {outer_patience} consecutive iters")
                 break
 
     # always return the best iterate seen

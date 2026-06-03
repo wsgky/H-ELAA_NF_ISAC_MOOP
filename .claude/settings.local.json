@@ -12,7 +12,13 @@
       "Bash(python main.py SOOP1_testing 2)",
       "Bash(python -c ' *)",
       "Bash(python main.py SOOP1_testing 5)",
-      "Bash(grep -v \"^\\\\s*$\")"
+      "Bash(grep -v \"^\\\\s*$\")",
+      "Bash(python -c \"import pypdf; print\\('pypdf', pypdf.__version__\\)\")",
+      "Bash(python -c \"import fitz; print\\('pymupdf', fitz.__doc__\\)\")",
+      "Bash(python -c \"import pdfplumber; print\\('pdfplumber ok'\\)\")",
+      "Bash(where pdftotext *)",
+      "Bash(where pdftoppm *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('algorithms/moop.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('experiments/exp_moop_convergence.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('config.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }

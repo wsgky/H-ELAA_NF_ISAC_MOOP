@@ -98,14 +98,33 @@ class SystemConfig:
 @dataclass
 class AlgorithmConfig:
     # ---- outer / inner iterations ----
-    outer_iters: int = 20
-    inner_iters: int = 100   # FP surrogate refreshes per outer iter (SOOP1 SP2)
+    SOOP1_outer_iters: int = 20
+    SOOP2_outer_iters: int = 20
+    MOOP_outer_iters: int = 10
+    SOOP1_inner_iters: int = 100
+    SOOP2_inner_iters: int = 100
+    MOOP_inner_iters: int = 500
+
+    sp5_iters: int = 1       # max SCA iterations inside SP5 at outer iter 0
+    sp5_decay: float = 1.0   # harmonic decay: n_sca(s) = max(1, round(sp5_iters/(1+decay*s)))
+    sp5_tol: float = 1e-3    # relative ΔW early-stop threshold within SP5 SCA loop
     pgd_steps: int = 20      # PGD steps per surrogate refresh (SOOP1 SP2)
-    tol: float = 1e-4
+    tol: float = 1e-5
 
     # ---- step sizes ----
-    pgd_step_a: float = 5e-4        # for amplitude PGD (SOOP2 / MOOP)
+    pgd_step_a: float = 1e-2        # for amplitude PGD (SOOP2 / MOOP)
     pgd_step_lambda: float = 1e-2   # for dual update (MOOP)
+
+    # ---- MOOP SP6 monotonic backtracking line search ----
+    # The amplitude (a) update is a projected-gradient ascent step on the
+    # Lagrangian. A plain step does NOT guarantee the *original* Tchebycheff
+    # objective tau rises, so we accept a candidate only if it does not
+    # decrease tau; otherwise the step is shrunk by bt_beta and retried.
+    bt_beta: float = 0.5            # step shrink factor (0<beta<1)
+    bt_max: int = 20                # max backtracking trials per inner step
+    MOOP_inner_patience: int = 15   # stop SP6 after this many no-progress steps
+    MOOP_outer_tol: float = 5e-4   # min τ improvement per outer iter to count as progress
+    MOOP_outer_patience: int = 3   # stop outer BCD after this many consecutive no-progress iters
 
     # ---- weighting (Tchebycheff) ----
     omega1: float = 0.5

@@ -222,7 +222,7 @@ def solve_SOOP2(scenario, sys_cfg, alg_cfg, full_history: bool = False):
     best_a = a.copy()
     best_W = None
 
-    for it in range(alg_cfg.outer_iters):
+    for it in range(alg_cfg.SOOP2_outer_iters):
         F = compute_F(a, Phi)
 
         # SP3' via CVX
@@ -243,7 +243,7 @@ def solve_SOOP2(scenario, sys_cfg, alg_cfg, full_history: bool = False):
             a, hist_I, hist_R = _sp4_inner(
                 a, Phi, W, scenario.Bt_s, scenario.gamma_s2,
                 sigma_s2, sys_cfg.L, scenario.Mr,
-                iters=alg_cfg.inner_iters, step=alg_cfg.pgd_step_a,
+                iters=alg_cfg.SOOP2_inner_iters, step=alg_cfg.pgd_step_a,
                 full_history=True,
                 H=scenario.H, sigma2=sys_cfg.sigma2, Kc=Kc)
             history["inner_sensing_mi"].append([I_after_sdp] + hist_I)
@@ -252,7 +252,7 @@ def solve_SOOP2(scenario, sys_cfg, alg_cfg, full_history: bool = False):
             a = _sp4_inner(a, Phi, W,
                            scenario.Bt_s, scenario.gamma_s2,
                            sigma_s2, sys_cfg.L, scenario.Mr,
-                           iters=alg_cfg.inner_iters,
+                           iters=alg_cfg.SOOP2_inner_iters,
                            step=alg_cfg.pgd_step_a)
 
         F = compute_F(a, Phi)

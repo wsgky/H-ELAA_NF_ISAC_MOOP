@@ -1,0 +1,120 @@
+{
+  "label": "exp_moop_convergence",
+  "sys_cfg": {
+    "Mt_h": 16,
+    "Mt_v": 4,
+    "Mr_h": 16,
+    "Mr_v": 4,
+    "N": 8,
+    "rhs_structure": "subarray",
+    "fc": 30000000000.0,
+    "eps_r": 3.0,
+    "delta_factor": 0.25,
+    "Kc": 3,
+    "Ks": 2,
+    "Ke": 2,
+    "J_nlos": 3,
+    "near_field_radius": [
+      2.0,
+      15.0
+    ],
+    "Pt_dBm": 10.0,
+    "sigma2_dBm": 0.0,
+    "sigma_s2_dBm": 0.0,
+    "L": 64,
+    "kappa": 10.0,
+    "rcs_st_dB": 0.0,
+    "rcs_cu_dB": 0.0,
+    "rcs_eo_dB": 0.0,
+    "seed": 2025
+  },
+  "alg_cfg": {
+    "outer_iters": 1,
+    "inner_iters": 20000,
+    "pgd_steps": 20,
+    "tol": 0.0001,
+    "pgd_step_a": 0.0005,
+    "pgd_step_lambda": 0.01,
+    "omega1": 0.5,
+    "omega2": 0.5,
+    "cvx_solver": "SCS",
+    "cvx_verbose": false,
+    "eig_tol": 1e-09,
+    "nesterov": true
+  },
+  "R_star": 32.3296125925952,
+  "I_star": 36.36787556614567,
+  "omega1": 0.5,
+  "omega2": 0.5,
+  "MOOP_history": {
+    "sum_rate": [
+      24.743747189433996
+    ],
+    "sensing_mi": [
+      27.862282718402458
+    ],
+    "tau": [
+      -0.11732069757153035
+    ],
+    "inner_R": [
+      [
+        24.743651329721672,
+        24.743747189433996
+      ]
+    ],
+    "inner_I": [
+      [
+        27.862219320042986,
+        27.862282718402458
+      ]
+    ],
+    "inner_tau": [
+      [
+        -0.11732218010881795,
+        -0.11732069757153035
+      ]
+    ],
+    "inner_duality_gap": [
+      [
+        NaN,
+        6.931184351673737e-06
+      ]
+    ],
+    "sp6_lam1": [
+      [
+        0.00798012382596416
+      ]
+    ],
+    "sp6_lam2": [
+      [
+        0.006654380672455878
+      ]
+    ],
+    "sp6_grad_norm": [
+      [
+        0.0404148838156619
+      ]
+    ],
+    "sp6_da_norm": [
+      [
+        2.019468931369291e-05
+      ]
+    ]
+  },
+  "SOOP1_history": {
+    "sum_rate": [
+      32.3296125925952
+    ],
+    "sensing_mi": [
+      29.543003506801842
+    ]
+  },
+  "SOOP2_history": {
+    "sum_rate": [
+      7.5181205416050725
+    ],
+    "sensing_mi": [
+      36.36787556614567
+    ]
+  }
+}
