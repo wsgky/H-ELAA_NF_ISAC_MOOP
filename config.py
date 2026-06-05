@@ -137,3 +137,4 @@ class AlgorithmConfig:
     # ---- numerical guards ----
     eig_tol: float = 1e-9
     nesterov: bool = True
+    eps_dom: float = 1e-6            # domain lower bound for d_k^W >= eps_dom (Eq. 63d)

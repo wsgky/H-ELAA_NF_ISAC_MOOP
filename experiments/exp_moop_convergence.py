@@ -46,17 +46,18 @@ _SYS_CFG = SystemConfig(
     Mt_h=128, Mt_v=8,    # Mt = 128
     Mr_h=128, Mr_v=8,    # Mr = 128
     N=8,
-    Kc=3, Ks=2, Ke=2,
+    Kc=3, Ks=3, Ke=2,
     L=128,
     seed=2025,
+    rhs_structure= "fully_connected"
 )
 _ALG_CFG = AlgorithmConfig(
     SOOP1_outer_iters=20,
     SOOP2_outer_iters=20,
     MOOP_outer_iters=25,
-    SOOP1_inner_iters=300,
-    SOOP2_inner_iters=300,
-    MOOP_inner_iters=600,
+    SOOP1_inner_iters=500,
+    SOOP2_inner_iters=500,
+    MOOP_inner_iters=500,
     sp5_iters=20,
     sp5_tol=1e-4,
     pgd_step_a=1e-2,
@@ -65,7 +66,7 @@ _ALG_CFG = AlgorithmConfig(
     # SP6 monotonic backtracking line search on the original tau
     bt_beta=0.5,
     bt_max=20,
-    MOOP_inner_patience=15,
+    MOOP_inner_patience=20,
     omega1=0.5,
     omega2=0.5)
 
