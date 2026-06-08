@@ -41,16 +41,17 @@ class SystemConfig:
     Ks: int = 2                     # # STs
     Ke: int = 2                     # # EOs (clutter)
     J_nlos: int = 3                 # # NLoS scatters per CU
+    rmin: float = 2.0                # min near-field radius (meters)
     near_field_radius: Tuple[float, float] = (2.0, 15.0)  # meters
 
     # ---- power & noise ----
-    Pt_dBm: float = 10.0            # total TX power (dBm)
+    Pt_dBm: float = 30.0            # total TX power (dBm)
     sigma2_dBm: float = 0.0       # noise power per CU (dBm)
     sigma_s2_dBm: float = 0.0     # sensing noise (dBm)
     L: int = 256                    # symbol block length
 
     # ---- path-gain / RCS ----
-    kappa: float = 10.0             # Rician factor (LoS/NLoS power ratio)
+    kappa: float = 8.0             # Rician factor (LoS/NLoS power ratio)
     rcs_st_dB: float = 0.0         # ST gamma^2 variance in dB (10^(x/10))
     rcs_cu_dB: float = 0.0         # CU clutter gamma^2 variance in dB
     rcs_eo_dB: float = 0.0          # EO gamma^2 variance in dB

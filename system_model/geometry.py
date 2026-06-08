@@ -76,7 +76,8 @@ def feed_positions(N: int, M_h: int, M_v: int, delta: float,
 
 def random_near_field_position(rng: np.random.Generator,
                                r_range: Tuple[float, float],
-                               half_space: bool = True) -> np.ndarray:
+                            #    half_space: bool = True
+                               ) -> np.ndarray:
     """
     Draw a position (in 3D) inside the near-field region of the BS.
 
@@ -85,11 +86,13 @@ def random_near_field_position(rng: np.random.Generator,
     half_space=True.
     """
     r = rng.uniform(*r_range)
-    if half_space:
-        phi = rng.uniform(-np.pi / 2 + 0.05, np.pi / 2 - 0.05)
-    else:
-        phi = rng.uniform(-np.pi, np.pi)
-    theta = rng.uniform(-np.pi / 4, np.pi / 4)
+    # print(f"Random near-field range: r={r:.2f} m")  # DEBUG
+    # if half_space:
+    #     phi = rng.uniform(-np.pi / 3 , np.pi / 3)
+    # else:
+    #     phi = rng.uniform(-np.pi, np.pi)
+    phi = rng.uniform(-np.pi / 3 , np.pi / 3)
+    theta = rng.uniform(-np.pi / 6, np.pi / 6)
     e = np.array([np.cos(theta) * np.cos(phi),
                   np.cos(theta) * np.sin(phi),
                   np.sin(theta)])

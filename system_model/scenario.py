@@ -98,7 +98,6 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
                              cfg.delta, cfg.lambda_w,
                              structure=cfg.rhs_structure)
 
-    # ---------------- CUs ----------------
     Kc = cfg.Kc
     Mt = cfg.Mt
     H = np.zeros((Kc, Mt), dtype=complex)
@@ -106,7 +105,19 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
     Bt_c = np.zeros((Mt, Kc), dtype=complex)
     Br_c = np.zeros((cfg.Mr, Kc), dtype=complex)
     gamma_c2 = np.zeros(Kc)
+    # ---------------- geometry ---------------- Ensure the near-field region
 
+    D_r = np.sqrt(((cfg.Mr_h-1) * cfg.delta) ** 2 + ((cfg.Mr_v-1) * cfg.delta) ** 2)  # RX aperture diagonal
+    D_t = np.sqrt(((cfg.Mt_h-1) * cfg.delta) ** 2 + ((cfg.Mt_v-1) * cfg.delta) ** 2)  # TX aperture diagonal
+    D_min=min(D_r, D_t)
+    D_max=max(D_r, D_t)
+    d_R = 2 * D_min**2 / cfg.lambda0  # Rayleigh distance of RX RHS
+    d_rea=0.68*np.sqrt(D_max**3 / cfg.lambda0)  # practical near-field range (where beamfocusing gain is close to max)
+    rmin = max(cfg.rmin, 1.2*d_rea)
+    rmax = 0.8*d_R
+    cfg.near_field_radius = (rmin, rmax)  # for convenience in geometry.py
+
+    # ---------------- CUs ----------------
     for k in range(Kc):
         h_k, info = generate_channel_vector(
             rng, cfg.Mt_h, cfg.Mt_v, cfg.delta, cfg.lambda0,
