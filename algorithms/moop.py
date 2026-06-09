@@ -41,13 +41,13 @@ import numpy as np
 try:
     import cvxpy as cp
     _HAVE_CVX = True
+    # _HAVE_CVX = False
 except Exception:
     cp = None
     _HAVE_CVX = False
 
 from .utils import (
-    compute_F, sum_rate, sensing_mi, scale_W_to_power, project_box,
-    transmit_power,
+    compute_F, sum_rate, sensing_mi, scale_W_to_power,
 )
 from .soop1_comm import solve_SOOP1
 from .soop2_sense import solve_SOOP2
@@ -216,6 +216,7 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
         Z_prev = W_curr.copy()                     # z_k^(i) = w_k^(i-1)
 
         if not _HAVE_CVX:
+            print("[**********Error**********]: SP5 is not solved via CVX]")
             break
 
         # line 8: solve Eq. (63)
@@ -253,9 +254,9 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
         g2_sum = cp.sum([cp.log1p(expr) for expr in g2_exprs])
 
         cons = [
-            f1_sum >= (tau / omega1 + 1.0) * R_star * np.log(2.0),   # Eq. 63b
-            g2_sum >= (tau / omega2 + 1.0) * I_star * np.log(2.0),   # Eq. 63c
-            cp.sum_squares(F @ W_var) <= Pt,                           # Eq. 63e
+            f1_sum >= (tau / omega1 + 1.0) * R_star * np.log(2.0),   # Eq. 73b
+            g2_sum >= (tau / omega2 + 1.0) * I_star * np.log(2.0),   # Eq. 73c
+            cp.sum_squares(F @ W_var) <= Pt,                           # Eq. 73e
         ]
         # Eq. 63d: domain constraint d_k^W >= eps_dom
         for expr in g2_exprs:
@@ -296,7 +297,7 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
 def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
                omega1, omega2,
                lam1_init: float = None, lam2_init: float = None,
-               full_history: bool = False):
+               full_history: bool = False, sp5_test: bool = False):
     """
     Amplitude sub-problem with fixed W (Algorithm 1 lines 14-29).
 
@@ -332,6 +333,7 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
     lam1_max = omega1 / R_star
     # lam1 = lam1_init if lam1_init is not None else 0.5 * lam1_max
     lam1 = np.random.uniform(0.0, lam1_max) if lam1_init is None else lam1_init
+    
     lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
     lam2 = max(lam2, 0.0)
 
@@ -351,8 +353,14 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
 
     # pre-compute pieces that don't depend on a:
     # Q_k and coefficient for each ST (sensing surrogate Q matrix)
+    Pt = sys_cfg.Pt
     PhiW = Phi @ W                                 # (Mt, Kc+Ks)
     PhiW_PhiW_H = PhiW @ PhiW.conj().T             # (Mt, Mt)
+
+    # P_W = diag(Re{diag(C_W)}),  p_m = ||[Phi W]_m||^2  (Eq. 74-75)
+    # Power constraint: a^T P_W a <= Pt  (Eq. 76)
+    p_diag = np.real(np.diag(PhiW_PhiW_H))         # (Mt,), non-negative
+
     Q_sens = []
     coeff_sens = []
     for k in range(Ks):
@@ -363,114 +371,126 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
 
     bt_beta = getattr(alg_cfg, "bt_beta", 0.5)
     bt_max  = getattr(alg_cfg, "bt_max", 20)
+    if sp5_test:
+        print("[**********SP5 Testing**********]: SP6 is not solved]")
+        best_tau_sp6  = _tau_sp6(R0_sp6, I0_sp6)
+        best_a_sp6    = np.random.uniform(0.0, 1.0, size=Mt)
+        best_lam1_sp6 = lam1
+        best_lam2_sp6 = lam2
+    else:
+        # inner loop: lines 18-27 of Algorithm 1
+        for t in range(alg_cfg.MOOP_inner_iters):
 
-    # inner loop: lines 18-27 of Algorithm 1
-    for t in range(alg_cfg.MOOP_inner_iters):
+            # ---- Step 1: eval R, I at current a^(t-1) ----
+            F = compute_F(a, Phi)
+            HF = H @ F
+            R_cur = sum_rate(scenario.H, F, W, sigma2, Kc)
+            I_cur = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
+                            sigma_s2, sys_cfg.L, Mr)
+            tau_cur = _tau_sp6(R_cur, I_cur)
 
-        # ---- Step 1: eval R, I at current a^(t-1) ----
-        F = compute_F(a, Phi)
-        HF = H @ F
-        R_cur = sum_rate(scenario.H, F, W, sigma2, Kc)
-        I_cur = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
-                           sigma_s2, sys_cfg.L, Mr)
-        tau_cur = _tau_sp6(R_cur, I_cur)
+            # ---- Step 2 (line 19): update mu*, xi* (Eq. 49-50) ----
+            sig  = HF @ W
+            abs2 = np.abs(sig) ** 2
+            mu   = np.zeros(Kc)
+            xi   = np.zeros(Kc, dtype=complex)
+            for k in range(Kc):
+                num    = abs2[k, k]
+                denom  = abs2[k, :].sum() - abs2[k, k] + sigma2
+                mu[k]  = num / max(denom, 1e-30)
+                denom2 = abs2[k, :].sum() + sigma2
+                xi[k]  = (np.sqrt(1 + mu[k]) * (HF[k] @ W[:, k])
+                        / max(denom2, 1e-30))
 
-        # ---- Step 2 (line 19): update mu*, xi* (Eq. 49-50) ----
-        sig  = HF @ W
-        abs2 = np.abs(sig) ** 2
-        mu   = np.zeros(Kc)
-        xi   = np.zeros(Kc, dtype=complex)
-        for k in range(Kc):
-            num    = abs2[k, k]
-            denom  = abs2[k, :].sum() - abs2[k, k] + sigma2
-            mu[k]  = num / max(denom, 1e-30)
-            denom2 = abs2[k, :].sum() + sigma2
-            xi[k]  = (np.sqrt(1 + mu[k]) * (HF[k] @ W[:, k])
-                      / max(denom2, 1e-30))
+            # ---- Step 3 (line 20): z = a (linearization point) ----
+            z = a.copy()
 
-        # ---- Step 3 (line 20): z = a (linearization point) ----
-        z = a.copy()
+            # ---- Step 4 (line 21): UPDATE lambda1, lambda2 FIRST (Eq. 76-78) ----
+            # dg/dlambda1 (Eq. 77), evaluated at current a (tight surrogate)
+            d_lam1 = ((R_cur - R_star)
+                    - (omega2 * R_star) / (omega1 * I_star) * (I_cur - I_star))
+            lam1 = float(np.clip(lam1 - alg_cfg.pgd_step_lambda * d_lam1,
+                                0.0, lam1_max))                # Eq. 76
+            # lam2 = max((omega2 / I_star) * (1.0 - lam1 * R_star / omega1), 0.0)  # Eq. 78
+            lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
+            # ---- Step 5: build Q_bar (Eq. 71), u_bar (Eq. 72) for comm surrogate ----
+            Q_bar = np.zeros((Mt, Mt))
+            u_bar = np.zeros(Mt)
+            for k in range(Kc):
+                Dk    = H[k, :]
+                DkPhi = Dk[:, None] * Phi
+                Qk    = DkPhi @ W
+                Q_bar += (np.abs(xi[k]) ** 2) * np.real(Qk @ Qk.conj().T)
+                u_bar += 2.0 * np.sqrt(1 + mu[k]) * np.real(
+                    (DkPhi @ W[:, k]) * np.conj(xi[k]))
 
-        # ---- Step 4 (line 21): UPDATE lambda1, lambda2 FIRST (Eq. 76-78) ----
-        # dg/dlambda1 (Eq. 77), evaluated at current a (tight surrogate)
-        d_lam1 = ((R_cur - R_star)
-                  - (omega2 * R_star) / (omega1 * I_star) * (I_cur - I_star))
-        lam1 = float(np.clip(lam1 - alg_cfg.pgd_step_lambda * d_lam1,
-                             0.0, lam1_max))                # Eq. 76
-        # lam2 = max((omega2 / I_star) * (1.0 - lam1 * R_star / omega1), 0.0)  # Eq. 78
-        lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
-        # ---- Step 5: build Q_bar (Eq. 71), u_bar (Eq. 72) for comm surrogate ----
-        Q_bar = np.zeros((Mt, Mt))
-        u_bar = np.zeros(Mt)
-        for k in range(Kc):
-            Dk    = H[k, :]
-            DkPhi = Dk[:, None] * Phi
-            Qk    = DkPhi @ W
-            Q_bar += (np.abs(xi[k]) ** 2) * np.real(Qk @ Qk.conj().T)
-            u_bar += 2.0 * np.sqrt(1 + mu[k]) * np.real(
-                (DkPhi @ W[:, k]) * np.conj(xi[k]))
+            # ---- gradient of psi wrt a using UPDATED lam1, lam2 (Eq. 79) ----
+            grad_comm = lam1 * (-2.0 * (Q_bar @ a) + u_bar)
 
-        # ---- gradient of psi wrt a using UPDATED lam1, lam2 (Eq. 79) ----
-        grad_comm = lam1 * (-2.0 * (Q_bar @ a) + u_bar)
+            grad_sens = np.zeros(Mt)
+            for k in range(Ks):
+                ck  = coeff_sens[k]
+                # Qk  = np.real(ck * Q_sens[k])
+                Qk = ck * Q_sens[k]
+                Qkz = Qk @ z
+                zQz = float(np.real(z @ Qkz))
+                zQa = float(np.real(z @ (Qk @ a)))
+                denom = 1.0 - zQz + 2.0 * zQa          # = 1 + ck*(2 a^T Qk z - z^T Qk z)
+                grad_sens += 2.0 * np.real(Qkz) / max(denom, 1e-12)
+            grad_sens *= lam2
 
-        grad_sens = np.zeros(Mt)
-        for k in range(Ks):
-            ck  = coeff_sens[k]
-            # Qk  = np.real(ck * Q_sens[k])
-            Qk = ck * Q_sens[k]
-            Qkz = Qk @ z
-            zQz = float(np.real(z @ Qkz))
-            zQa = float(np.real(z @ (Qk @ a)))
-            denom = 1.0 - zQz + 2.0 * zQa          # = 1 + ck*(2 a^T Qk z - z^T Qk z)
-            grad_sens += 2.0 * np.real(Qkz) / max(denom, 1e-12)
-        grad_sens *= lam2
+            grad_psi  = grad_comm + grad_sens
+            grad_norm = float(np.linalg.norm(grad_psi))
 
-        grad_psi  = grad_comm + grad_sens
-        grad_norm = float(np.linalg.norm(grad_psi))
+            # ---- Step 6 (line 22): BTLS update a^(t) by Eq. (80) ----
+            a_prev = a.copy()
+            step   = alg_cfg.pgd_step_a / (1.0 + grad_norm / max(Mt, 1))
+            R_now, I_now, tau_now = R_cur, I_cur, tau_cur
+            for _bt in range(bt_max):
+                # Project onto A_W = {a: 0<=a_m<=1, a^T P_W a <= Pt}  (Eq. 80)
+                # Step 1: box projection
+                a_cand = np.clip(a_prev + step * grad_psi, 0.0, 1.0)
+                # Step 2: if power constraint violated, scale down uniformly
+                pwr_cand = float(np.dot(p_diag, a_cand ** 2))
+                if pwr_cand > Pt:
+                    a_cand *= np.sqrt(Pt / pwr_cand)
+                F_cand  = compute_F(a_cand, Phi)
+                R_cand  = sum_rate(scenario.H, F_cand, W, sigma2, Kc)
+                I_cand  = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_cand, W,
+                                    sigma_s2, sys_cfg.L, Mr)
+                tau_cand = _tau_sp6(R_cand, I_cand)
+                if tau_cand >= tau_cur - 1e-12:
+                    a = a_cand
+                    R_now, I_now, tau_now = R_cand, I_cand, tau_cand
+                    break
+                step *= bt_beta
 
-        # ---- Step 6 (line 22): BTLS update a^(t) by Eq. (80) ----
-        a_prev = a.copy()
-        step   = alg_cfg.pgd_step_a / (1.0 + grad_norm / max(Mt, 1))
-        R_now, I_now, tau_now = R_cur, I_cur, tau_cur
-        for _bt in range(bt_max):
-            a_cand  = project_box(a_prev + step * grad_psi, 0.0, 1.0)
-            F_cand  = compute_F(a_cand, Phi)
-            R_cand  = sum_rate(scenario.H, F_cand, W, sigma2, Kc)
-            I_cand  = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_cand, W,
-                                 sigma_s2, sys_cfg.L, Mr)
-            tau_cand = _tau_sp6(R_cand, I_cand)
-            if tau_cand >= tau_cur - 1e-12:
-                a = a_cand
-                R_now, I_now, tau_now = R_cand, I_cand, tau_cand
+            da_norm = float(np.linalg.norm(a - a_prev))
+
+            # ---- Step 7 (line 23): recover tau^(t) by Eq. (81) ----
+            # Δ_in = |tau^(t) - tau^(t-1)|,  Δ_a = ||a^(t) - a^(t-1)||
+            delta_in = abs(tau_now - tau_cur)
+            delta_a  = da_norm
+
+            # best-iterate safeguard (under monotone BTLS, best == latest accepted)
+            if tau_now > best_tau_sp6:
+                best_tau_sp6  = tau_now
+                best_a_sp6    = a.copy()
+                best_lam1_sp6 = lam1
+                best_lam2_sp6 = lam2
+
+            if full_history:
+                inner_hist["R"].append(R_now)
+                inner_hist["I"].append(I_now)
+                inner_hist["duality_gap"].append(delta_in)
+                inner_hist["lam1"].append(lam1)
+                inner_hist["lam2"].append(lam2)
+                inner_hist["grad_norm"].append(grad_norm)
+                inner_hist["da_norm"].append(da_norm)
+
+            # ---- line 25: stop if Δ_a <= tol AND Δ_in <= tol ----
+            if delta_a <= alg_cfg.tol and delta_in <= alg_cfg.tol:
                 break
-            step *= bt_beta
-
-        da_norm = float(np.linalg.norm(a - a_prev))
-
-        # ---- Step 7 (line 23): recover tau^(t) by Eq. (81) ----
-        # Δ_in = |tau^(t) - tau^(t-1)|,  Δ_a = ||a^(t) - a^(t-1)||
-        delta_in = abs(tau_now - tau_cur)
-        delta_a  = da_norm
-
-        # best-iterate safeguard (under monotone BTLS, best == latest accepted)
-        if tau_now > best_tau_sp6:
-            best_tau_sp6  = tau_now
-            best_a_sp6    = a.copy()
-            best_lam1_sp6 = lam1
-            best_lam2_sp6 = lam2
-
-        if full_history:
-            inner_hist["R"].append(R_now)
-            inner_hist["I"].append(I_now)
-            inner_hist["duality_gap"].append(delta_in)
-            inner_hist["lam1"].append(lam1)
-            inner_hist["lam2"].append(lam2)
-            inner_hist["grad_norm"].append(grad_norm)
-            inner_hist["da_norm"].append(da_norm)
-
-        # ---- line 25: stop if Δ_a <= tol AND Δ_in <= tol ----
-        if delta_a <= alg_cfg.tol and delta_in <= alg_cfg.tol:
-            break
 
     return best_a_sp6, best_lam1_sp6, best_lam2_sp6, inner_hist
 
@@ -554,44 +574,40 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
     best_a, best_W = a.copy(), W.copy()
     best_R, best_I = R0, I0
 
-    # lam1 warm-start: starts at centre of feasible range; updated to SP6's
-    # best lam1 only when the outer iterate is ACCEPTED.  If rejected we
-    # restore the pre-step value so a bad SP6 run never poisons lam1_warm.
-    # lam1_warm = 0.5 * omega1 / R_star_safe
-    ########### stop criteria tracking ##############
+    # lam1 warm-start: centre of feasible range; updated only on acceptance
+    lam1_warm = 0.5 * omega1 / R_star_safe
     no_progress = 0
-    outer_patience = getattr(alg_cfg, 'MOOP_outer_patience', 5)
-
-    # outer loop: BCD order SP6 → SP5 (so W is always re-optimised under the
-    # same F used to record tau, eliminating the post-SP6 power-rescaling drop)
+    # outer_patience = getattr(alg_cfg, 'MOOP_outer_patience', 5)
+    outer_patience = alg_cfg.MOOP_outer_patience
+    # outer loop: BCD order SP5 → SP6
     for it in range(alg_cfg.MOOP_outer_iters):
-        a_prev_iter  = a.copy()
-        W_prev_iter  = W.copy()
+        a_prev_iter   = a.copy()
+        W_prev_iter   = W.copy()
         tau_prev_iter = tau_cur
-        # lam1_warm_prev = lam1_warm      # save before SP6 in case of rejection
+        lam1_warm_prev = lam1_warm
 
-        # full_history checkpoint: state BEFORE SP6 (consistent with plot_sp6_per_outer
-        # which does seg[1:] to strip this first element, leaving SP6 inner steps)
+        # ---- SP5: digital BF for current a ----
+        W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
+                               a, W, R_star, I_star, omega1, omega2,
+                               outer_iter=it, tau_init=tau_cur)
+
+        # full_history checkpoint: state after SP5, before SP6
         if full_history:
             F_ck = compute_F(a, Phi)
-            R_ck = sum_rate(scenario.H, F_ck, W, sys_cfg.sigma2, Kc)
-            I_ck = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_ck, W,
+            R_ck = sum_rate(scenario.H, F_ck, W_new, sys_cfg.sigma2, Kc)
+            I_ck = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_ck, W_new,
                               sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
 
-        # ---- SP6: amplitude update for current W ----
-        # a_new, lam1_best, _, sp6_hist = _solve_SP6(
-        #     scenario, sys_cfg, alg_cfg,
-        #     a, W, R_star, I_star,
-        #     omega1, omega2, lam1_init=lam1_warm,
-        #     full_history=full_history)
+        # ---- SP6: amplitude update for W_new ----
         a_new, lam1_best, _, sp6_hist = _solve_SP6(
             scenario, sys_cfg, alg_cfg,
-            a, W, R_star, I_star,
-            omega1, omega2,
+            a, W_new, R_star, I_star,
+            omega1, omega2, lam1_init=lam1_warm,
             full_history=full_history)
-        
+        F_new = compute_F(a_new, Phi)
+        W_new = scale_W_to_power(F_new, W_new, sys_cfg.Pt)
+
         if full_history and sp6_hist is not None:
-            # checkpoint first so plot_sp6_per_outer's seg[1:] strips it correctly
             outer_R   = [R_ck] + sp6_hist["R"]
             outer_I   = [I_ck] + sp6_hist["I"]
             outer_gap = [float("nan")] + sp6_hist["duality_gap"]
@@ -604,15 +620,9 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             history["sp6_grad_norm"].append(sp6_hist["grad_norm"])
             history["sp6_da_norm"].append(sp6_hist["da_norm"])
 
-        # ---- SP5: digital BF for a_new — W consistent with F_new by design ----
-        W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
-                               a_new, W, R_star, I_star, omega1, omega2,
-                               outer_iter=it, tau_init=tau_cur)
-
         # evaluate the candidate (a_new, W_new)
-        F_cand = compute_F(a_new, Phi)
-        R_cand = sum_rate(scenario.H, F_cand, W_new, sys_cfg.sigma2, Kc)
-        I_cand = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_cand, W_new,
+        R_cand = sum_rate(scenario.H, F_new, W_new, sys_cfg.sigma2, Kc)
+        I_cand = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_new, W_new,
                             sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
         tau_cand = _tau(R_cand, I_cand)
 
@@ -623,16 +633,14 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             best_tau = tau_cur
             best_a, best_W = a.copy(), W.copy()
             best_R, best_I = R_cand, I_cand
-            lam1_warm = lam1_best       # update warm-start only from accepted SP6
+            lam1_warm = lam1_best
             R_now, I_now = R_cand, I_cand
             accepted = True
             no_progress = 0
         else:
-            # reject: revert (a, W) and lam1_warm; reuse tau_prev_iter directly
-            # to avoid any floating-point drift in the recomputed tau
             a, W = a_prev_iter, W_prev_iter
-            # lam1_warm = lam1_warm_prev
-            tau_cur = tau_prev_iter     # exact equality: history stays flat, not decreasing
+            lam1_warm = lam1_warm_prev
+            tau_cur = tau_prev_iter
             F_rev = compute_F(a, Phi)
             R_now = sum_rate(scenario.H, F_rev, W, sys_cfg.sigma2, Kc)
             I_now = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_rev, W,
@@ -655,7 +663,11 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             break
 
     # always return the best iterate seen
-    a, W = best_a, best_W
+    W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
+                               best_a, W, R_star, I_star, omega1, omega2,
+                               outer_iter=it, tau_init=tau_cur)
+    a, W = best_a, W_new
+    # a, W = best_a, best_W
     F = compute_F(a, Phi)
 
     R_final = sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc)
