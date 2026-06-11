@@ -158,7 +158,7 @@ def _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev, omega1, omega2,
 # SP5 : digital BF (CVX)  — Algorithm 1 lines 4-13
 # =====================================================================
 def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
-               omega1, omega2, outer_iter: int = 0, tau_init: float = None):
+               omega1, omega2, outer_iter: int = 0, tau_init: float = None, test_mode: bool = False):
     """
     Digital sub-problem with fixed amplitudes a (Algorithm 1 lines 4-13).
 
@@ -194,12 +194,25 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
     for k in range(Ks):
         g_vecs[:, k] = np.sqrt(scenario.gamma_s2[k]) * (F.conj().T @ scenario.Bt_s[:, k])
 
+    def _tau_sp5(R, I):
+        return min(omega1 * (R - R_star) / R_star,
+                   omega2 * (I - I_star) / I_star)
+
     W_curr = scale_W_to_power(F, W_prev.copy(), Pt)
     tau_val = tau_init       # tau_W^(0) = tau^(s-1)  [Algorithm 1 line 5]
-    success = False
+
+    # best-iterate safeguard on the ACTUAL tau (not the CVX surrogate).
+    # The CVX/SCS solve can return an "inaccurate" W whose surrogate tau
+    # looks improved but whose real tau is worse (surrogate constraints
+    # violated) -> never let SP5 hand back something worse than its input.
+    R_b = sum_rate(scenario.H, F, W_curr, sigma2, Kc)
+    I_b = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W_curr,
+                      sigma_s2, L, Mr)
+    best_tau_sp5 = _tau_sp5(R_b, I_b)
+    best_W_sp5   = W_curr.copy()
 
     # SCA inner loop: lines 6-12 of Algorithm 1
-    for _ in range(alg_cfg.sp5_iters):
+    for sca_iter in range(alg_cfg.sp5_iters):
         # lines 7: update mu_k*, xi_k* (Eq. 49-50)
         sig  = HF @ W_curr
         abs2 = np.abs(sig) ** 2
@@ -269,27 +282,216 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
             prob.solve(solver="SCS", verbose=False)
 
         if W_var.value is None:
+            print(f"    [SP5 s={outer_iter+1}] CVX failed at SCA iter "
+                  f"{sca_iter+1}/{alg_cfg.sp5_iters}; using best W so far")
             break                                  # CVX failed; use best W so far
 
         W_new   = scale_W_to_power(F, np.asarray(W_var.value), Pt)
         tau_new = float(tau.value) if tau.value is not None else tau_val
 
+        # track the best ACTUAL tau seen so far (cf. comment above)
+        R_new = sum_rate(scenario.H, F, W_new, sigma2, Kc)
+        I_new = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W_new,
+                            sigma_s2, L, Mr)
+        tau_actual = _tau_sp5(R_new, I_new)
+        if tau_actual > best_tau_sp5:
+            best_tau_sp5 = tau_actual
+            best_W_sp5   = W_new.copy()
+
         # line 9: stopping |tau_W^(i) - tau_W^(i-1)| <= tol
-        if tau_val is not None and abs(tau_new - tau_val) < sp5_tol:
+        dtau_sca = abs(tau_new - tau_val) if tau_val is not None else float("inf")
+        if tau_val is not None and dtau_sca < sp5_tol:
             W_curr  = W_new
             tau_val = tau_new
-            success = True
+            if test_mode == True:   
+                print(f"    [SP5 s={outer_iter+1}] converged at SCA iter "
+                    f"{sca_iter+1}/{alg_cfg.sp5_iters}  |dtau|={dtau_sca:.2e}")
             break
 
         tau_val = tau_new
         W_curr  = W_new
-    #     success = True
+    else:
+        if test_mode == True:
+            print(f"    [SP5 s={outer_iter+1}] did not converge within "
+                    f"{alg_cfg.sp5_iters} SCA iters")
 
-    # if not success:
-    #     return _sp5_fallback(scenario, sys_cfg, alg_cfg, a, W_prev,
-    #                          omega1, omega2, R_star, I_star)
-    return W_curr, tau_val
+    return best_W_sp5, best_tau_sp5
 
+# =====================================================================
+# SP5_v2 : Decompose the power constraint to be Mt-independent (CVX)  — Algorithm 1 lines 4-13
+# =====================================================================
+
+def _solve_SP5_v2(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
+               omega1, omega2, outer_iter: int = 0, tau_init: float = None, test_mode: bool = False):
+    """
+    Digital sub-problem with fixed amplitudes a (Algorithm 1 lines 4-13).
+
+    Solving Eq. (63) via CVX SCA:
+      - mu*, xi* updated once per SCA step (line 7, Eq. 49-50).
+      - Domain constraint d_k^W >= eps_dom added (Eq. 63d).
+      - Stopping: |tau_W^(i) - tau_W^(i-1)| <= tol (line 9).
+
+    tau_init: tau^(s-1) from the previous outer iteration, used as
+              tau_W^(0) for the inner stopping check (line 5).
+
+    Identical to _solve_SP5, except the power constraint (Eq. 73e) is
+    rewritten in Mt-independent form (see L_chol below).
+    """
+    Phi = scenario.Phi
+    H = scenario.H
+    Kc, Ks = scenario.Kc, scenario.Ks
+    N, Mt = scenario.N, scenario.Mt
+    Pt = sys_cfg.Pt
+    sigma2 = sys_cfg.sigma2
+    sigma_s2 = sys_cfg.sigma_s2
+    L = sys_cfg.L
+    Mr = scenario.Mr
+
+    F = compute_F(a, Phi)
+    HF = H @ F                                     # (Kc, N)
+
+    # Eq. 73e: ||F W||_F^2 = Tr(W^H (F^H F) W) = ||L_chol W||_F^2, where
+    # F^H F = L_chol^H L_chol (Hermitian sqrt via eigh, N x N). Replacing
+    # F (Mt x N) by L_chol (N x N) in the SOC constraint below shrinks its
+    # dimension from Mt*(Kc+Ks) to N*(Kc+Ks), independent of Mt.
+    FHF = F.conj().T @ F
+    eigvals, eigvecs = np.linalg.eigh(FHF)
+    eigvals = np.maximum(eigvals.real, 0.0)
+    L_chol = (eigvecs * np.sqrt(eigvals)[None, :]).conj().T
+
+    R_star = max(R_star, 1e-9)
+    I_star = max(I_star, 1e-9)
+
+    sp5_tol = alg_cfg.sp5_tol
+    eps_dom = getattr(alg_cfg, 'eps_dom', 1e-6)
+
+    # g_vecs depend only on F (fixed in SP5), pre-compute once
+    g_vecs = np.zeros((N, Ks), dtype=complex)
+    for k in range(Ks):
+        g_vecs[:, k] = np.sqrt(scenario.gamma_s2[k]) * (F.conj().T @ scenario.Bt_s[:, k])
+
+    def _tau_sp5(R, I):
+        return min(omega1 * (R - R_star) / R_star,
+                   omega2 * (I - I_star) / I_star)
+
+    W_curr = scale_W_to_power(F, W_prev.copy(), Pt)
+    tau_val = tau_init       # tau_W^(0) = tau^(s-1)  [Algorithm 1 line 5]
+
+    # best-iterate safeguard on the ACTUAL tau (not the CVX surrogate).
+    # The CVX/SCS solve can return an "inaccurate" W whose surrogate tau
+    # looks improved but whose real tau is worse (surrogate constraints
+    # violated) -> never let SP5 hand back something worse than its input.
+    R_b = sum_rate(scenario.H, F, W_curr, sigma2, Kc)
+    I_b = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W_curr,
+                      sigma_s2, L, Mr)
+    best_tau_sp5 = _tau_sp5(R_b, I_b)
+    best_W_sp5   = W_curr.copy()
+
+    # SCA inner loop: lines 6-12 of Algorithm 1
+    for sca_iter in range(alg_cfg.sp5_iters):
+        # lines 7: update mu_k*, xi_k* (Eq. 49-50)
+        sig  = HF @ W_curr
+        abs2 = np.abs(sig) ** 2
+        mu = np.zeros(Kc)
+        xi = np.zeros(Kc, dtype=complex)
+        for k in range(Kc):
+            num    = abs2[k, k]
+            denom  = abs2[k, :].sum() - abs2[k, k] + sigma2
+            mu[k]  = num / max(denom, 1e-30)
+            denom2 = abs2[k, :].sum() + sigma2
+            xi[k]  = (np.sqrt(1 + mu[k]) * (HF[k] @ W_curr[:, k])
+                      / max(denom2, 1e-30))
+
+        Z_prev = W_curr.copy()                     # z_k^(i) = w_k^(i-1)
+
+        if not _HAVE_CVX:
+            print("[**********Error**********]: SP5 is not solved via CVX]")
+            break
+
+        # line 8: solve Eq. (63)
+        W_var = cp.Variable((N, Kc + Ks), complex=True)
+        tau   = cp.Variable()
+
+        # f1_k: communication FP surrogate (Eq. 55 / Lemma 1)
+        f1_terms = []
+        for k in range(Kc):
+            const_k = float(
+                np.log(1 + mu[k]) - mu[k] - (np.abs(xi[k]) ** 2) * sigma2)
+            hF_k = HF[k, :]
+            lin  = 2.0 * np.sqrt(1 + mu[k]) * cp.real(
+                cp.conj(xi[k]) * (hF_k @ W_var[:, k]))
+            row  = hF_k @ W_var
+            quad = (np.abs(xi[k]) ** 2) * cp.sum_squares(row)
+            f1_terms.append(const_k + lin - quad)
+        f1_sum = cp.sum(f1_terms)
+
+        # g2: sensing FP surrogate (Eq. 55), build d_k^W expressions
+        g2_exprs = []
+        for k in range(Ks):
+            gk      = g_vecs[:, k]
+            lin_g   = 0
+            const_g = 0.0
+            for i in range(Kc + Ks):
+                zi      = Z_prev[:, i]
+                ai      = np.conj(zi) @ gk
+                lin_g   = lin_g + 2.0 * cp.real(
+                    np.conj(ai) * (gk.conj() @ W_var[:, i]))
+                const_g += float(np.abs(ai) ** 2)
+            coef_k = (L * Mr) / sigma_s2
+            g2_exprs.append(coef_k * (lin_g - const_g))
+
+        g2_sum = cp.sum([cp.log1p(expr) for expr in g2_exprs])
+
+        cons = [
+            f1_sum >= (tau / omega1 + 1.0) * R_star * np.log(2.0),   # Eq. 73b
+            g2_sum >= (tau / omega2 + 1.0) * I_star * np.log(2.0),   # Eq. 73c
+            cp.sum_squares(L_chol @ W_var) <= Pt,                      # Eq. 73e
+        ]
+        # Eq. 63d: domain constraint d_k^W >= eps_dom
+        for expr in g2_exprs:
+            cons.append(expr >= eps_dom - 1.0)
+
+        prob = cp.Problem(cp.Maximize(tau), cons)
+        try:
+            prob.solve(solver=alg_cfg.cvx_solver, verbose=alg_cfg.cvx_verbose)
+        except Exception:
+            prob.solve(solver="SCS", verbose=False)
+
+        if W_var.value is None:
+            print(f"    [SP5 s={outer_iter+1}] CVX failed at SCA iter "
+                  f"{sca_iter+1}/{alg_cfg.sp5_iters}; using best W so far")
+            break                                  # CVX failed; use best W so far
+
+        W_new   = scale_W_to_power(F, np.asarray(W_var.value), Pt)
+        tau_new = float(tau.value) if tau.value is not None else tau_val
+
+        # track the best ACTUAL tau seen so far (cf. comment above)
+        R_new = sum_rate(scenario.H, F, W_new, sigma2, Kc)
+        I_new = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W_new,
+                            sigma_s2, L, Mr)
+        tau_actual = _tau_sp5(R_new, I_new)
+        if tau_actual > best_tau_sp5:
+            best_tau_sp5 = tau_actual
+            best_W_sp5   = W_new.copy()
+
+        # line 9: stopping |tau_W^(i) - tau_W^(i-1)| <= tol
+        dtau_sca = abs(tau_new - tau_val) if tau_val is not None else float("inf")
+        if tau_val is not None and dtau_sca < sp5_tol:
+            W_curr  = W_new
+            tau_val = tau_new
+            if test_mode == True:   
+                print(f"    [SP5 s={outer_iter+1}] converged at SCA iter "
+                    f"{sca_iter+1}/{alg_cfg.sp5_iters}  |dtau|={dtau_sca:.2e}")
+            break
+
+        tau_val = tau_new
+        W_curr  = W_new
+    else:
+        if test_mode == True:
+            print(f"    [SP5 s={outer_iter+1}] did not converge within "
+                    f"{alg_cfg.sp5_iters} SCA iters")
+
+    return best_W_sp5, best_tau_sp5
 
 # =====================================================================
 # SP6 : amplitude BF via Lagrangian dual  — Algorithm 1 lines 14-29
@@ -297,7 +499,8 @@ def _solve_SP5(scenario, sys_cfg, alg_cfg, a, W_prev, R_star, I_star,
 def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
                omega1, omega2,
                lam1_init: float = None, lam2_init: float = None,
-               full_history: bool = False, sp5_test: bool = False):
+               full_history: bool = False, sp5_test: bool = False,
+               outer_iter: int = 0, test_mode: bool = False):
     """
     Amplitude sub-problem with fixed W (Algorithm 1 lines 14-29).
 
@@ -332,7 +535,8 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
     # lambda1 initialisation: passed from outer loop (Algorithm 1 line 16)
     lam1_max = omega1 / R_star
     # lam1 = lam1_init if lam1_init is not None else 0.5 * lam1_max
-    lam1 = np.random.uniform(0.0, lam1_max) if lam1_init is None else lam1_init
+    # lam1 = np.random.uniform(0.0, lam1_max) if lam1_init is None else lam1_init
+    lam1 = np.random.uniform(0.0, lam1_max)
     
     lam2 = (omega2 / I_star) * (1.0 - lam1 * R_star / omega1)
     lam2 = max(lam2, 0.0)
@@ -379,6 +583,7 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
         best_lam2_sp6 = lam2
     else:
         # inner loop: lines 18-27 of Algorithm 1
+        num_no_progress = 0
         for t in range(alg_cfg.MOOP_inner_iters):
 
             # ---- Step 1: eval R, I at current a^(t-1) ----
@@ -444,7 +649,8 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
 
             # ---- Step 6 (line 22): BTLS update a^(t) by Eq. (80) ----
             a_prev = a.copy()
-            step   = alg_cfg.pgd_step_a / (1.0 + grad_norm / max(Mt, 1))
+            # step   = alg_cfg.pgd_step_a / (1.0 + grad_norm / max(Mt, 1))
+            step   = alg_cfg.pgd_step_a
             R_now, I_now, tau_now = R_cur, I_cur, tau_cur
             for _bt in range(bt_max):
                 # Project onto A_W = {a: 0<=a_m<=1, a^T P_W a <= Pt}  (Eq. 80)
@@ -459,17 +665,24 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
                 I_cand  = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F_cand, W,
                                     sigma_s2, sys_cfg.L, Mr)
                 tau_cand = _tau_sp6(R_cand, I_cand)
-                if tau_cand >= tau_cur - 1e-12:
+                if tau_cand >= tau_cur - 1e-12: 
                     a = a_cand
                     R_now, I_now, tau_now = R_cand, I_cand, tau_cand
+                    if test_mode == True:
+                         print(f"    [SP6 s={outer_iter+1}] BTLS accepted at inner iter "
+                               f"{t+1}/{alg_cfg.MOOP_inner_iters} after {_bt+1} backtracks  "
+                               f"(tau {tau_cur:.4f} -> {tau_now:.4f})")
                     break
                 step *= bt_beta
-
-            da_norm = float(np.linalg.norm(a - a_prev))
-
+            else:
+                if test_mode == True:
+                    print(f"    [SP6 s={outer_iter+1}] BTLS failed to improve after, maybe has reached a local max at inner iter "
+                        f"{bt_max} backtracks at inner iter {t+1}/{alg_cfg.MOOP_inner_iters}  "
+                        f"(best tau {tau_cur:.4f} -> candidate tau {tau_cand:.4f})")
             # ---- Step 7 (line 23): recover tau^(t) by Eq. (81) ----
             # Δ_in = |tau^(t) - tau^(t-1)|,  Δ_a = ||a^(t) - a^(t-1)||
             delta_in = abs(tau_now - tau_cur)
+            da_norm = float(np.linalg.norm(a - a_prev))
             delta_a  = da_norm
 
             # best-iterate safeguard (under monotone BTLS, best == latest accepted)
@@ -490,7 +703,24 @@ def _solve_SP6(scenario, sys_cfg, alg_cfg, a_init, W, R_star, I_star,
 
             # ---- line 25: stop if Δ_a <= tol AND Δ_in <= tol ----
             if delta_a <= alg_cfg.tol and delta_in <= alg_cfg.tol:
+                # print(f"    [SP6 s={outer_iter+1}] converged at inner iter "
+                #       f"{t+1}/{alg_cfg.MOOP_inner_iters}  "
+                #       f"da={delta_a:.2e} dtau={delta_in:.2e}")
+                # break
+                num_no_progress +=1
+            else:
+                num_no_progress = 0
+            if num_no_progress >= alg_cfg.MOOP_inner_patience:
+                if test_mode == True:
+                    print(f"    [SP6 s={outer_iter+1}] stopping at inner iter "
+                        f"{t+1}/{alg_cfg.MOOP_inner_iters} due to no progress "
+                        f"(da={delta_a:.2e} dtau={delta_in:.2e})")
                 break
+        else:
+            if test_mode == True:
+                print(f"    [SP6 s={outer_iter+1}] did not converge within "
+                    f"{alg_cfg.MOOP_inner_iters} inner iters "
+                    f"(da={delta_a:.2e} dtau={delta_in:.2e})")
 
     return best_a_sp6, best_lam1_sp6, best_lam2_sp6, inner_hist
 
@@ -570,6 +800,10 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
     I0 = sensing_mi(scenario.Bt_s, scenario.gamma_s2, F, W,
                     sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
     tau_cur = _tau(R0, I0)
+    history["sum_rate"].append(R0)
+    history["sensing_mi"].append(I0)
+    history["tau"].append(tau_cur)       # non-decreasing by construction
+    print(f" [MOOP initial value] R={R0:.3f} I={I0:.3f} tau={tau_cur:.4f}")
     best_tau = tau_cur
     best_a, best_W = a.copy(), W.copy()
     best_R, best_I = R0, I0
@@ -587,9 +821,12 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
         lam1_warm_prev = lam1_warm
 
         # ---- SP5: digital BF for current a ----
-        W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
+        # W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
+        #                        a, W, R_star, I_star, omega1, omega2,
+        #                        outer_iter=it, tau_init=tau_cur, test_mode=full_history)
+        W_new, _ = _solve_SP5_v2(scenario, sys_cfg, alg_cfg,
                                a, W, R_star, I_star, omega1, omega2,
-                               outer_iter=it, tau_init=tau_cur)
+                               outer_iter=it, tau_init=tau_cur, test_mode=full_history)
 
         # full_history checkpoint: state after SP5, before SP6
         if full_history:
@@ -603,9 +840,9 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             scenario, sys_cfg, alg_cfg,
             a, W_new, R_star, I_star,
             omega1, omega2, lam1_init=lam1_warm,
-            full_history=full_history)
+            full_history=full_history, outer_iter=it, test_mode=full_history)
         F_new = compute_F(a_new, Phi)
-        W_new = scale_W_to_power(F_new, W_new, sys_cfg.Pt)
+        # W_new = scale_W_to_power(F_new, W_new, sys_cfg.Pt)
 
         if full_history and sp6_hist is not None:
             outer_R   = [R_ck] + sp6_hist["R"]
@@ -627,7 +864,10 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
         tau_cand = _tau(R_cand, I_cand)
 
         # ---- outer acceptance: accept only if tau does not decrease ----
-        if tau_cand >= best_tau or it == 0:
+        # (SP5 and SP6 both carry best-iterate safeguards on the actual
+        # tau, so tau_cand >= best_tau holds by construction even at it=0)
+        if tau_cand >= best_tau:
+            improvement = tau_cand - best_tau
             a, W = a_new, W_new
             tau_cur = tau_cand
             best_tau = tau_cur
@@ -636,7 +876,12 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             lam1_warm = lam1_best
             R_now, I_now = R_cand, I_cand
             accepted = True
-            no_progress = 0
+            # negligible improvement counts toward outer_patience too,
+            # so the loop can stop once tau has effectively converged
+            if improvement < alg_cfg.MOOP_outer_tol:
+                no_progress += 1
+            else:
+                no_progress = 0
         else:
             a, W = a_prev_iter, W_prev_iter
             lam1_warm = lam1_warm_prev
@@ -648,7 +893,7 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
             accepted = False
             no_progress += 1
 
-        print(f"  [MOOP s={it}] R={R_now:.3f} I={I_now:.3f} tau={tau_cur:.4f}"
+        print(f"  [MOOP s={it+1}] R={R_now:.3f} I={I_now:.3f} tau={tau_cur:.4f}"
               f"  dtau={abs(tau_cur - tau_prev_iter):.4f}"
               f"  {'ACC' if accepted else 'REJ'}"
               f"  no_prog={no_progress}")
@@ -657,17 +902,19 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
         history["sensing_mi"].append(I_now)
         history["tau"].append(tau_cur)       # non-decreasing by construction
 
-        # stop when accepted tau is flat for outer_patience consecutive iters
+        # stop when tau improvement is negligible (or rejected) for
+        # outer_patience consecutive iters
         if no_progress >= outer_patience:
-            print(f"  [MOOP] outer stopped: {outer_patience} consecutive rejections")
+            print(f"  [MOOP] outer stopped: {outer_patience} consecutive iters "
+                  f"with d_tau < {alg_cfg.MOOP_outer_tol}")
             break
 
     # always return the best iterate seen
-    W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
-                               best_a, W, R_star, I_star, omega1, omega2,
-                               outer_iter=it, tau_init=tau_cur)
-    a, W = best_a, W_new
-    # a, W = best_a, best_W
+    # W_new, _ = _solve_SP5(scenario, sys_cfg, alg_cfg,
+    #                            best_a, W, R_star, I_star, omega1, omega2,
+    #                            outer_iter=it, tau_init=tau_cur)
+    # a, W = best_a, W_new
+    a, W = best_a, best_W
     F = compute_F(a, Phi)
 
     R_final = sum_rate(scenario.H, F, W, sys_cfg.sigma2, Kc)

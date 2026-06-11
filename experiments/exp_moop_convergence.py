@@ -43,30 +43,32 @@ from algorithms import solve_SOOP1, solve_SOOP2, solve_MOOP
 
 # ── small config: runs fast enough to see convergence clearly ─────────────
 _SYS_CFG = SystemConfig(
-    Mt_h=128, Mt_v=8,    # Mt = 128
-    Mr_h=128, Mr_v=8,    # Mr = 128
+    Mt_h=256, Mt_v=16,    # Mt = 128
+    Mr_h=256, Mr_v=16,    # Mr = 128
     N=8,
-    Kc=3, Ks=3, Ke=2,
-    L=128,
+    Kc=4, Ks=2, Ke=2,
+    L=1024,
+    # seed=2025+201,
     seed=2025,
-    rhs_structure= "fully_connected"
+    rhs_structure= "fully_connected",  # "fully_connected" or "subarray"
 )
 _ALG_CFG = AlgorithmConfig(
     SOOP1_outer_iters=20,
     SOOP2_outer_iters=20,
-    MOOP_outer_iters=25,
-    SOOP1_inner_iters=500,
-    SOOP2_inner_iters=500,
+    MOOP_outer_iters=50,
+    SOOP1_inner_iters=300,
+    SOOP2_inner_iters=300,
     MOOP_inner_iters=500,
-    sp5_iters=20,
+    sp5_iters=30,
     sp5_tol=1e-4,
     pgd_step_a=1e-2,
-    pgd_step_lambda=8e-2,
+    pgd_step_lambda=1e-2,
     tol=1e-5,
     # SP6 monotonic backtracking line search on the original tau
     bt_beta=0.5,
     bt_max=20,
-    MOOP_inner_patience=20,
+    MOOP_inner_patience=10,
+    MOOP_outer_patience=5,
     omega1=0.5,
     omega2=0.5)
 
@@ -118,10 +120,33 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
         outer_x.append(cursor - 1)
     outer_x = np.array(outer_x)
 
-    # accepted outer-iter values (coarse history)
-    outer_R   = hist["sum_rate"][:n_outer]
-    outer_I   = hist["sensing_mi"][:n_outer]
-    outer_tau = hist["tau"][:n_outer]
+    # history[0] is the initialisation point (before any outer iteration);
+    # history[1..n_outer] are the accepted outer-iter endpoints.
+    has_init = len(hist["sum_rate"]) > n_outer
+    if has_init:
+        init_R   = hist["sum_rate"][0]
+        init_I   = hist["sensing_mi"][0]
+        init_tau = hist["tau"][0]
+        outer_R   = hist["sum_rate"][1:n_outer + 1]
+        outer_I   = hist["sensing_mi"][1:n_outer + 1]
+        outer_tau = hist["tau"][1:n_outer + 1]
+    else:
+        outer_R   = hist["sum_rate"][:n_outer]
+        outer_I   = hist["sensing_mi"][:n_outer]
+        outer_tau = hist["tau"][:n_outer]
+
+    # x-position for the init point: ~8% of total width to the left so the
+    # connecting segment to x=0 is clearly visible on the plot
+    x_init = -max(50, int(len(x_fine) * 0.08))
+
+    # prepend init point to fine-grained arrays so the line starts from it
+    if has_init:
+        x_line   = np.concatenate([[x_init], x_fine])
+        line_R   = [init_R]   + fine_R
+        line_I   = [init_I]   + fine_I
+        line_tau = [init_tau] + fine_tau
+    else:
+        x_line, line_R, line_I, line_tau = x_fine, fine_R, fine_I, fine_tau
 
     # ── figure : 2×2 layout ───────────────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
@@ -129,7 +154,9 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
     clr_outer = "C1"
     clr_ref   = "C2"
     clr_gap   = "C3"
-    marker_kw = dict(marker="D", s=60, zorder=5, edgecolors="k", linewidths=0.5)
+    clr_init  = "C4"
+    marker_kw      = dict(marker="D", s=60, zorder=5, edgecolors="k", linewidths=0.5)
+    marker_init_kw = dict(marker="*", s=120, zorder=6, edgecolors="k", linewidths=0.5)
 
     def _vlines(ax, total_len):
         cursor = 0
@@ -144,9 +171,12 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
 
     # ── [0,0] R ───────────────────────────────────────────────────────────
     ax = axes[0, 0]
-    ax.plot(x_fine, fine_R, color=clr_fine, linewidth=1.2, label="SP6 inner steps")
+    ax.plot(x_line, line_R, color=clr_fine, linewidth=1.2, label="SP6 inner steps")
     ax.scatter(outer_x, outer_R, color=clr_outer, label="Accepted outer-iter R",
                **marker_kw)
+    if has_init:
+        ax.scatter([x_init], [init_R], color=clr_init, label="Init point",
+                   **marker_init_kw)
     ax.axhline(R_star, color=clr_ref, linestyle=":", linewidth=1.6,
                label=f"R* = {R_star:.3f}")
     ax.set_xlabel("Cumulative inner step")
@@ -158,9 +188,12 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
 
     # ── [0,1] I ───────────────────────────────────────────────────────────
     ax = axes[0, 1]
-    ax.plot(x_fine, fine_I, color=clr_fine, linewidth=1.2, label="SP6 inner steps")
+    ax.plot(x_line, line_I, color=clr_fine, linewidth=1.2, label="SP6 inner steps")
     ax.scatter(outer_x, outer_I, color=clr_outer, label="Accepted outer-iter I",
                **marker_kw)
+    if has_init:
+        ax.scatter([x_init], [init_I], color=clr_init, label="Init point",
+                   **marker_init_kw)
     ax.axhline(I_star, color=clr_ref, linestyle=":", linewidth=1.6,
                label=f"I* = {I_star:.3f}")
     ax.set_xlabel("Cumulative inner step")
@@ -172,16 +205,20 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
 
     # ── [1,0] tau  (the curve that MUST be monotone) ──────────────────────
     ax = axes[1, 0]
-    ax.plot(x_fine, fine_tau, color=clr_fine, linewidth=1.0, alpha=0.5,
+    ax.plot(x_line, line_tau, color=clr_fine, linewidth=1.0, alpha=0.5,
             label="SP6 inner steps")
     # accepted outer-level tau: this is the convergence-proof curve
     ax.plot(outer_x, outer_tau, color=clr_outer, linewidth=1.8,
             marker="D", markersize=7, markeredgecolor="k", markeredgewidth=0.5,
             zorder=6, label="Accepted outer-iter τ")
+    if has_init:
+        ax.scatter([x_init], [init_tau], color=clr_init,
+                   label="Init point", **marker_init_kw)
     ax.axhline(0, color="gray", linewidth=0.6, alpha=0.5)
-    # annotate monotonicity of the accepted outer-level tau
-    n_viol = sum(1 for i in range(1, len(outer_tau))
-                 if outer_tau[i] < outer_tau[i - 1] - 1e-9)
+    # annotate monotonicity (check from init point onward)
+    full_tau_seq = ([init_tau] + list(outer_tau)) if has_init else list(outer_tau)
+    n_viol = sum(1 for i in range(1, len(full_tau_seq))
+                 if full_tau_seq[i] < full_tau_seq[i - 1] - 1e-9)
     ax.text(0.02, 0.02,
             f"accepted-τ monotone: {'YES' if n_viol == 0 else f'NO ({n_viol})'}",
             transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
@@ -227,6 +264,71 @@ def plot_moop_convergence(m, R_star, I_star, omega1, omega2, alg_cfg,
         f"(stop after {getattr(alg_cfg, 'MOOP_inner_patience', '?')} no-progress steps)"
     )
     fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    return fig
+def plot_moop_convergence_v2(m, R_star, I_star, omega1, omega2,
+                             suptitle=""):
+    """
+    Simple 1×3 convergence plot: R, I, τ vs outer iteration index s.
+
+    x-axis: s = 0 (init), 1, 2, ... (accepted outer iterations)
+    history["sum_rate"][0] is the init point; [1:] are per-outer-iter values.
+    """
+    hist = m["history"]
+    R_seq   = hist["sum_rate"]    # [init, s0, s1, ...]
+    I_seq   = hist["sensing_mi"]
+    tau_seq = hist["tau"]
+    s_seq   = list(range(len(R_seq)))   # x-axis: 0 = init
+
+    # ── style knobs — edit freely ──────────────────────────────────────────
+    fig_size   = (14, 4)
+    clr_line   = "steelblue"        # convergence line colour
+    clr_marker = "darkorange"       # per-iter marker fill
+    clr_init   = "mediumpurple"     # init-point star colour
+    clr_ref    = "green"            # reference line (R*, I*)
+    lw         = 1.8                # line width
+    ms         = 7                  # circle marker size
+    # ──────────────────────────────────────────────────────────────────────
+
+    fig, axes = plt.subplots(1, 3, figsize=fig_size)
+
+    def _panel(ax, y_seq, y_ref, ref_label, ylabel, title):
+        ax.plot(s_seq, y_seq, color=clr_line, linewidth=lw,
+                marker="o", markersize=ms,
+                markerfacecolor=clr_marker, markeredgecolor="k",
+                markeredgewidth=0.5, label="Accepted iter")
+        ax.scatter([0], [y_seq[0]], color=clr_init, marker="*", s=180,
+                   zorder=5, edgecolors="k", linewidths=0.5, label="Init")
+        if y_ref is not None:
+            ax.axhline(y_ref, color=clr_ref, linestyle=":", linewidth=1.5,
+                       label=ref_label)
+        ax.set_xlabel("Outer iteration s")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    _panel(axes[0], R_seq,   R_star, f"R* = {R_star:.2f}",
+           "Sum-rate [bits/Hz]", "R convergence")
+
+    _panel(axes[1], I_seq,   I_star, f"I* = {I_star:.2f}",
+           "Sensing MI [bits/Hz]", "I convergence")
+
+    _panel(axes[2], tau_seq, None,   None,
+           "τ (Tchebycheff)", "τ convergence")
+    axes[2].axhline(0, color="gray", linewidth=0.6, alpha=0.5)
+    n_viol = sum(1 for a, b in zip(tau_seq, tau_seq[1:]) if b < a - 1e-9)
+    axes[2].text(0.98, 0.05,
+                 f"monotone: {'YES' if n_viol == 0 else f'NO ({n_viol})'}",
+                 transform=axes[2].transAxes, fontsize=8,
+                 va="bottom", ha="right",
+                 color="green" if n_viol == 0 else "red",
+                 bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.8))
+
+    fig.suptitle(suptitle or
+                 f"MOOP outer convergence | ω=({omega1:.2f},{omega2:.2f}) | "
+                 f"R*={R_star:.2f}  I*={I_star:.2f}",
+                 fontsize=10)
     fig.tight_layout()
     return fig
 
@@ -351,7 +453,7 @@ def main():
 
     # ── monotonicity check ────────────────────────────────────────────────
     tau_hist = m["history"]["tau"]
-    viols = sum(1 for i in range(1, len(tau_hist)) if tau_hist[i] < tau_hist[i-1] - 1e-9)
+    viols = sum(1 for a, b in zip(tau_hist, tau_hist[1:]) if b < a - 1e-9)
     print(f"  Tau monotonicity violations (outer): {viols}")
 
     # ── save JSON ─────────────────────────────────────────────────────────
@@ -375,8 +477,10 @@ def main():
     print(f"  JSON -> {json_path}")
 
     # ── Figure 1: 2×2 coarse convergence ─────────────────────────────────
-    fig1 = plot_moop_convergence(
-        m, R_star, I_star, alg_cfg.omega1, alg_cfg.omega2, alg_cfg)
+    fig1 = plot_moop_convergence_v2(
+        m, R_star, I_star, alg_cfg.omega1, alg_cfg.omega2)
+    # fig1 = plot_moop_convergence(
+        # m, R_star, I_star, alg_cfg.omega1, alg_cfg.omega2, alg_cfg)
     fig1_path = json_path.with_suffix(".png")
     fig1.savefig(fig1_path, dpi=150, bbox_inches="tight")
     print(f"  Figure 1 -> {fig1_path}")
@@ -384,16 +488,16 @@ def main():
     if sys.platform == "win32":
         os.startfile(str(fig1_path))
 
-    # ── Figure 2: 2×4 SP6 per-outer-iter detail ───────────────────────────
-    fig2 = plot_sp6_per_outer(
-        m, R_star, I_star, alg_cfg.omega1, alg_cfg.omega2, alg_cfg)
-    fig2_path = json_path.with_name(
-        json_path.stem + "_sp6detail" + ".png")
-    fig2.savefig(fig2_path, dpi=150, bbox_inches="tight")
-    print(f"  Figure 2 -> {fig2_path}")
-    plt.close(fig2)
-    if sys.platform == "win32":
-        os.startfile(str(fig2_path))
+    # # ── Figure 2: 2×4 SP6 per-outer-iter detail ───────────────────────────
+    # fig2 = plot_sp6_per_outer(
+    #     m, R_star, I_star, alg_cfg.omega1, alg_cfg.omega2, alg_cfg)
+    # fig2_path = json_path.with_name(
+    #     json_path.stem + "_sp6detail" + ".png")
+    # fig2.savefig(fig2_path, dpi=150, bbox_inches="tight")
+    # print(f"  Figure 2 -> {fig2_path}")
+    # plt.close(fig2)
+    # if sys.platform == "win32":
+    #     os.startfile(str(fig2_path))
 
 
 if __name__ == "__main__":

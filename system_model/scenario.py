@@ -115,6 +115,8 @@ def generate_scenario(cfg, rng: np.random.Generator = None) -> Scenario:
     d_rea=0.68*np.sqrt(D_max**3 / cfg.lambda0)  # practical near-field range (where beamfocusing gain is close to max)
     rmin = max(cfg.rmin, 1.2*d_rea)
     rmax = 0.8*d_R
+    if rmax <= rmin:       # small test arrays: Rayleigh dist < cfg.rmin
+        rmax = rmin * 2.0
     cfg.near_field_radius = (rmin, rmax)  # for convenience in geometry.py
 
     # ---------------- CUs ----------------

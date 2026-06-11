@@ -20,6 +20,7 @@ import numpy as np
 try:
     import cvxpy as cp
     _HAVE_CVX = True
+    # _HAVE_CVX = False   # force-disable CVX for testing fallback
 except Exception:
     cp = None
     _HAVE_CVX = False
@@ -45,6 +46,7 @@ def _sp3_sdp(F: np.ndarray, Bt_s: np.ndarray, gamma_s2: np.ndarray,
         g[:, i] = np.sqrt(gamma_s2[i]) * (F.conj().T @ Bt_s[:, i])
 
     if not _HAVE_CVX:
+        print("[**********Warning**********]: CVX not available, fallback: gradient ascent on Hermitian PSD Omega.")
         # ---- fallback: gradient ascent on Hermitian PSD Omega ----
         # parametrise Omega = M M^H,  with M (N, r) and r = Ks (=> rank Ks).
         rng = np.random.default_rng(0)
