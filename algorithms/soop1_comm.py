@@ -20,7 +20,7 @@ Pipeline (alternating optimisation, manuscript Sec. V-A):
 """
 import numpy as np
 from typing import Tuple, Dict, List
-
+import time
 from .utils import (
     compute_F, compute_sinr, sum_rate, scale_W_to_power, project_box,
 )
@@ -312,7 +312,7 @@ def solve_SOOP1(scenario, sys_cfg, alg_cfg,
     W    = np.concatenate([W_c, W_s], axis=1)
     R_best = sum_rate(scenario.H, F, W, sigma2, Kc)
     a_best, W_best = a.copy(), W.copy()
-
+    print(f"[SOOP1 speed testing:before SP2 iterations]")
     for it in range(alg_cfg.SOOP1_outer_iters):
         # ---- SP1: ZF + water-filling on current a -------------------------
         F    = compute_F(a, Phi)
@@ -322,11 +322,15 @@ def solve_SOOP1(scenario, sys_cfg, alg_cfg,
 
         # ---- SP2: amplitude update ----------------------------------------
         surr_iters = max(1, alg_cfg.SOOP1_inner_iters // alg_cfg.pgd_steps)
-        a_new, sp2_hist = _sp2_inner_v2(a, scenario.H, Phi, W, sigma2, Kc,
-                                     iters=alg_cfg.SOOP1_inner_iters,
-                                    #  pgd_steps=alg_cfg.pgd_steps
+        print(f"[SOOP1 speed testing:SP2 outer iteration {it+1}/{alg_cfg.SOOP1_outer_iters}]")
+        time_start = time.time()  # dummy timer using RNG calls
+        a_new, sp2_hist = _sp2_inner(a, scenario.H, Phi, W, sigma2, Kc,
+                                     iters=surr_iters,
+                                     pgd_steps=alg_cfg.pgd_steps,
                                      )
-
+        time_end = time.time()
+        print(f"[SOOP1 speed testing:SP2 outer iteration {it+1}/{alg_cfg.SOOP1_outer_iters}] finished in {surr_iters} surrogate updates with {alg_cfg.SOOP1_inner_iters} PGD steps, took {time_end - time_start:.2f} seconds")
+        
         if full_history:
             history["inner_sum_rate"].append([R_after_wf] + sp2_hist)
 

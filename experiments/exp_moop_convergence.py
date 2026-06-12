@@ -429,21 +429,27 @@ def main():
 
     print(f"[exp_moop_convergence] Mt={sys_cfg.Mt}  Mr={sys_cfg.Mr}  "
           f"N={sys_cfg.N}  Kc={sys_cfg.Kc}  Ks={sys_cfg.Ks}")
-
-    print("[exp_moop_convergence] Running SOOP1 ...")
-    s1 = solve_SOOP1(scen, sys_cfg, alg_cfg)
-    R_star = s1["history"]["sum_rate"][-1]
+    
+    R_star =float(80.0)  # dummy R* for the reference line in the plots if SOOP1 is not run
+    I_star =float(80.0)  # dummy I* for the reference line in the plots if SOOP2 is not run
     print(f"  R* = {R_star:.4f} bits/Hz")
-
-    print("[exp_moop_convergence] Running SOOP2 ...")
-    s2 = solve_SOOP2(scen, sys_cfg, alg_cfg)
-    I_star = s2["history"]["sensing_mi"][-1]
     print(f"  I* = {I_star:.4f} bits/Hz")
+    if R_star is None:
+        print("[exp_moop_convergence] Running SOOP1 ...")
+        s1 = solve_SOOP1(scen, sys_cfg, alg_cfg)
+        R_star = s1["history"]["sum_rate"][-1]
+        print(f"  R* = {R_star:.4f} bits/Hz")
+    if I_star is None:
+        print("[exp_moop_convergence] Running SOOP2 ...")
+        s2 = solve_SOOP2(scen, sys_cfg, alg_cfg)
+        I_star = s2["history"]["sensing_mi"][-1]
+        print(f"  I* = {I_star:.4f} bits/Hz")
 
     print("[exp_moop_convergence] Running MOOP (full_history=True) ...")
     t0 = time.time()
     m = solve_MOOP(scen, sys_cfg, alg_cfg,
-                   soop1_result=s1, soop2_result=s2,
+                     R_star=R_star, I_star=I_star,
+                #    soop1_result=s1, soop2_result=s2,
                    full_history=True)
     elapsed = time.time() - t0
     print(f"  Done in {elapsed:.1f}s")
