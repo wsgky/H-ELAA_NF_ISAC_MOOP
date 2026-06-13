@@ -49,16 +49,16 @@ _SYS_CFG = SystemConfig(
     Kc=4, Ks=2, Ke=2,
     L=1024,
     # seed=2025+201,
-    seed=2025,
+    seed=2025+100,
     rhs_structure= "fully_connected",  # "fully_connected" or "subarray"
 )
 _ALG_CFG = AlgorithmConfig(
     SOOP1_outer_iters=20,
     SOOP2_outer_iters=20,
-    MOOP_outer_iters=50,
+    MOOP_outer_iters=100,
     SOOP1_inner_iters=300,
     SOOP2_inner_iters=300,
-    MOOP_inner_iters=500,
+    MOOP_inner_iters=50,
     sp5_iters=30,
     sp5_tol=1e-4,
     pgd_step_a=1e-2,
@@ -66,11 +66,11 @@ _ALG_CFG = AlgorithmConfig(
     tol=1e-5,
     # SP6 monotonic backtracking line search on the original tau
     bt_beta=0.5,
-    bt_max=20,
+    bt_max=30,
     MOOP_inner_patience=10,
     MOOP_outer_patience=5,
-    omega1=0.5,
-    omega2=0.5)
+    omega1=0.8,
+    omega2=0.2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,20 +430,20 @@ def main():
     print(f"[exp_moop_convergence] Mt={sys_cfg.Mt}  Mr={sys_cfg.Mr}  "
           f"N={sys_cfg.N}  Kc={sys_cfg.Kc}  Ks={sys_cfg.Ks}")
     
-    R_star =float(80.0)  # dummy R* for the reference line in the plots if SOOP1 is not run
-    I_star =float(80.0)  # dummy I* for the reference line in the plots if SOOP2 is not run
+    # R_star =float(80.0)  # dummy R* for the reference line in the plots if SOOP1 is not run
+    # I_star =float(80.0)  # dummy I* for the reference line in the plots if SOOP2 is not run
+    # print(f"  R* = {R_star:.4f} bits/Hz")
+    # print(f"  I* = {I_star:.4f} bits/Hz")
+    # if R_star is None:
+    print("[exp_moop_convergence] Running SOOP1 ...")
+    s1 = solve_SOOP1(scen, sys_cfg, alg_cfg)
+    R_star = s1["history"]["sum_rate"][-1]
     print(f"  R* = {R_star:.4f} bits/Hz")
+    # if I_star is None:
+    print("[exp_moop_convergence] Running SOOP2 ...")
+    s2 = solve_SOOP2(scen, sys_cfg, alg_cfg)
+    I_star = s2["history"]["sensing_mi"][-1]
     print(f"  I* = {I_star:.4f} bits/Hz")
-    if R_star is None:
-        print("[exp_moop_convergence] Running SOOP1 ...")
-        s1 = solve_SOOP1(scen, sys_cfg, alg_cfg)
-        R_star = s1["history"]["sum_rate"][-1]
-        print(f"  R* = {R_star:.4f} bits/Hz")
-    if I_star is None:
-        print("[exp_moop_convergence] Running SOOP2 ...")
-        s2 = solve_SOOP2(scen, sys_cfg, alg_cfg)
-        I_star = s2["history"]["sensing_mi"][-1]
-        print(f"  I* = {I_star:.4f} bits/Hz")
 
     print("[exp_moop_convergence] Running MOOP (full_history=True) ...")
     t0 = time.time()
