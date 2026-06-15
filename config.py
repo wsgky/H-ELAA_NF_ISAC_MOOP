@@ -125,7 +125,7 @@ class AlgorithmConfig:
     bt_max: int = 20                # max backtracking trials per inner step
     MOOP_inner_patience: int = 15   # stop SP6 after this many no-progress steps
     MOOP_outer_tol: float = 1e-4   # min τ improvement per outer iter to count as progress
-    MOOP_outer_patience: int = 3   # stop outer BCD after this many consecutive no-progress iters
+    MOOP_outer_patience: int = 10   # stop outer BCD after this many consecutive no-progress iters
 
     # ---- weighting (Tchebycheff) ----
     omega1: float = 0.5
