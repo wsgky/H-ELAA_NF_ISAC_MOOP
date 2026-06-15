@@ -838,16 +838,20 @@ def solve_MOOP(scenario, sys_cfg, alg_cfg,
                               sys_cfg.sigma_s2, sys_cfg.L, scenario.Mr)
 
         # ---- SP6: amplitude update for W_new ----
-        print(f"[MOOP speed testing:SP6 outer iteration {it+1}/{alg_cfg.MOOP_outer_iters}]")
-        time_start = time.time()  # dummy timer using RNG calls
+        if full_history:
+            print(f"[MOOP speed testing:SP6 outer iteration {it+1}/{alg_cfg.MOOP_outer_iters}]")
+            time_start = time.time()  # dummy timer using RNG calls
+            
         a_new, lam1_best, _, sp6_hist = _solve_SP6(
             scenario, sys_cfg, alg_cfg,
             a, W_new, R_star, I_star,
             omega1, omega2, lam1_init=lam1_warm,
             full_history=full_history, outer_iter=it, test_mode=full_history)
-        time_end = time.time()
-        print(f"[MOOP speed testing:SP6 outer iteration {it+1}/{alg_cfg.MOOP_outer_iters}] finished, took {time_end - time_start:.2f} seconds")
         
+        if full_history:
+            time_end = time.time()
+            print(f"[MOOP speed testing:SP6 outer iteration {it+1}/{alg_cfg.MOOP_outer_iters}] finished, took {time_end - time_start:.2f} seconds")
+            
         F_new = compute_F(a_new, Phi)
         # W_new = scale_W_to_power(F_new, W_new, sys_cfg.Pt)
 

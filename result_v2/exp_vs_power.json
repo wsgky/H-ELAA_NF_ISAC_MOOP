@@ -1,0 +1,25 @@
+{
+  "exp": "vs_power",
+  "schemes": [
+    "proposed",
+    "fully_digital",
+    "amplitude_only",
+    "random_rhs",
+    "uniform_rhs",
+    "far_field"
+  ],
+  "x_label": "$P_t$ [dBm]",
+  "meta": {
+    "sys_cfg": "SystemConfig(Mt_h=16, Mt_v=8, Mr_h=16, Mr_v=8, N=8, rhs_structure='subarray', fc=30000000000.0, eps_r=1.0, delta_factor=0.5, Kc=4, Ks=2, Ke=2, J_nlos=5, rmin=2.0, near_field_radius=(2.0, 15.0), Pt_dBm=30.0, sigma2_dBm=0.0, sigma_s2_dBm=0.0, L=64, kappa=8.0, rcs_st_dB=0.0, rcs_cu_dB=0.0, rcs_eo_dB=0.0, seed=2025)",
+    "alg_cfg": "AlgorithmConfig(SOOP1_outer_iters=10, SOOP2_outer_iters=10, MOOP_outer_iters=10, SOOP1_inner_iters=20, SOOP2_inner_iters=20, MOOP_inner_iters=20, sp5_iters=1, sp5_decay=1.0, sp5_tol=0.001, pgd_steps=20, tol=0.0001, pgd_step_a=0.01, pgd_step_lambda=0.01, bt_beta=0.5, bt_max=20, MOOP_inner_patience=15, MOOP_outer_tol=0.0001, MOOP_outer_patience=3, omega1=0.5, omega2=0.5, cvx_solver='SCS', cvx_verbose=False, eig_tol=1e-09, nesterov=True, eps_dom=1e-06)",
+    "n_mc": 3,
+    "base_seed": 2025,
+    "fixed_w1": 0.5,
+    "Pt_grid_dBm": [
+      20,
+      30
+    ],
+    "timestamp": "2026-06-13 19:54:14",
+    "git_note": "v2"
+  }
+}
