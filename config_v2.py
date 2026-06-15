@@ -76,15 +76,16 @@ KS_GRID_SMOKE = [1, 2]
 
 # Must match experiments_v2.schemes.SCHEME_NAMES (kept as a literal here
 # to avoid experiments_v2 <-> config_v2 import-order coupling).
+# DEFAULT_SCHEMES = [
+#     "proposed",
+#     "fully_digital",
+#     "amplitude_only",
+#     "random_rhs",
+#     "uniform_rhs",
+#     "far_field",
+# ]
 DEFAULT_SCHEMES = [
-    "proposed",
-    "fully_digital",
-    "amplitude_only",
-    "random_rhs",
-    "uniform_rhs",
-    "far_field",
-]
-
+     "proposed"]
 
 # ----------------------------------------------------------------------
 # Base SystemConfig / AlgorithmConfig (Table I)
